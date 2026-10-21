@@ -38,11 +38,13 @@ if (!existsSync(join(fixtures, 'data', 'demo.db'))) {
 build({ fixtures, graph, workspace, now });
 
 /** A stand-in platform: it checks the idempotency key header and answers with a receipt. */
+const platformCalls = [];
 const platform = await new Promise((resolve) => {
   const server = createServer((request, response) => {
     let body = '';
     request.on('data', (chunk) => { body += chunk; });
     request.on('end', () => {
+      platformCalls.push(request.headers['idempotency-key']);
       const key = request.headers['idempotency-key'];
       const cells = JSON.parse(body || '{}').cells ?? [];
       response.writeHead(key && cells.length > 0 ? 200 : 400, { 'content-type': 'application/json' });
@@ -80,7 +82,7 @@ try {
   section('1. the catalogue carries the new routes, with their roles');
   const catalogue = await http('GET', '/v1/tools');
   const tools = catalogue.body.tools;
-  check('the catalogue grew', tools.length >= 30, `${tools.length} routes`);
+  check('the catalogue grew', tools.length >= 35, `${tools.length} routes`);
   const expected = [
     ['POST', '/v1/semantic/version', 'viewer'],
     ['POST', '/v1/semantic/shadow', 'viewer'],
@@ -91,6 +93,8 @@ try {
     ['POST', '/v1/risk/conflicts', 'viewer'],
     ['POST', '/v1/risk/capacity', 'viewer'],
     ['POST', '/v1/campaign/writeback', 'analyst'],
+    ['GET', '/v1/semantic/release', 'viewer'],
+    ['POST', '/v1/semantic/release', 'owner'],
   ];
   for (const [method, path, role] of expected) {
     const tool = tools.find((entry) => entry.method === method && entry.path === path);
@@ -224,6 +228,20 @@ try {
     `${committed.body.receipt.idempotencyKey} vs ${dry.body.payload.idempotencyKey}`);
   const replayed = await http('POST', '/v1/campaign/writeback', { budget: 3000000, commit: true, confirmToken: confirmMode.body.token }, 'owner');
   checkEqual('replaying the same token is the same request (same key, not a second plan)', replayed.body.receipt.idempotencyKey, committed.body.receipt.idempotencyKey);
+  checkEqual('the replay is labelled as one', replayed.body.receipt.status, 'replayed');
+  checkEqual('and the platform was called once, not twice', platformCalls.length, 1);
+  const other = await http('POST', '/v1/campaign/writeback', { budget: 3200000, commit: true, mode: 'confirm' }, 'owner');
+  const otherCommit = await http('POST', '/v1/campaign/writeback', { budget: 3200000, commit: true, confirmToken: other.body.token }, 'owner');
+  check('a different plan is a different key', otherCommit.body.receipt.idempotencyKey !== committed.body.receipt.idempotencyKey,
+    `${otherCommit.body.receipt.idempotencyKey} vs ${committed.body.receipt.idempotencyKey}`);
+  checkEqual('so the platform is called again', platformCalls.length, 2);
+  const store = readFileSync(join(workspace, 'writeback', 'idempotency.jsonl'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  check('our own store records both commits', store.length === 2 && store.every((entry) => entry.status === 'committed'),
+    store.map((entry) => `${entry.key.slice(0, 8)}:${entry.status}`).join(' '));
+  check('with the actor and the receipt', store.every((entry) => entry.actor === 'alice' && typeof entry.receiptId === 'string'),
+    `${store[0]?.actor} ${store[0]?.receiptId}`);
+  check('and a payload hash that is not the key', store.every((entry) => entry.payloadHash.length === 32 && entry.payloadHash !== entry.key),
+    store[0]?.payloadHash?.slice(0, 8) ?? '');
   delete process.env.PAGENT_WRITEBACK_URL;
 
   section('7. the audit trail covers the new routes');

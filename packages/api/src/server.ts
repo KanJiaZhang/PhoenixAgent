@@ -36,8 +36,10 @@ import { attribute } from '../../agents/attribution/src/index.ts';
 import { campaign } from '../../agents/campaign/src/index.ts';
 import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
 import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
+import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
 import { ask, askHybrid, AskSession, learnWord, loadLexicon, lexiconPath, type Turn } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
+import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
 import { createGateway } from '../../core/src/llm.ts';
 import { authenticate, loadAuth, requireRole, Forbidden, Unauthorized, type AuthConfig, type Principal, type Role } from './auth.ts';
 import { ConfirmTokens, ConfirmationRejected } from './confirm.ts';
@@ -443,18 +445,105 @@ function buildRoutes(): RouteDef[] {
       method: 'POST', path: '/v1/semantic/ask', role: 'viewer',
       summary: 'a question over the semantic model: interpret, render, execute, explain', input: ['question', 'spec', 'graph', 'compare'],
       handler: (request, context) => {
-        const { index, report } = loadModel(context, String(request.body.graph ?? context.options.graph));
+        const graph = String(request.body.graph ?? context.options.graph);
         const spec = request.body.spec as Record<string, unknown> | undefined;
         const merged = spec
           ? { ...spec, ...(request.body.compare ? { compare: request.body.compare } : {}) }
           : undefined;
-        return withDatabase(context, (run) => semanticAsk({
-          ...(typeof request.body.question === 'string' ? { question: request.body.question } : {}),
-          ...(merged ? { spec: merged as never } : {}),
-          index,
-          run,
-          modelRevision: typeof report?.modelVersion === 'number' ? report.modelVersion : null,
-        }));
+        return withCanary(request, context, graph, typeof request.body.question === 'string' ? request.body.question : '',
+          (chosen) => withDatabase(context, (run) => semanticAsk({
+            ...(typeof request.body.question === 'string' ? { question: request.body.question } : {}),
+            ...(merged ? { spec: merged as never } : {}),
+            index: chosen.index,
+            run,
+            modelRevision: chosen.revision,
+          })));
+      },
+    },
+    {
+      method: 'GET', path: '/v1/semantic/release', role: 'viewer',
+      summary: 'the release in flight: revisions, canary share, evidence, and the event log', input: ['graph'],
+      handler: (request, context) => {
+        const graph = String(request.query.get('graph') ?? context.options.graph);
+        const store = new ReleaseStore(context.options.workspace, graph);
+        return { config: store.get(), evidence: store.canaryEvidence(), events: store.events().slice(-50) };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/release', role: 'owner',
+      summary: 'start, promote or roll back a canary release between two published revisions',
+      input: ['action', 'from', 'to', 'canaryPct', 'reason', 'question'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const store = new ReleaseStore(context.options.workspace, graph);
+        const action = requireString(request.body, 'action');
+        const now = context.options.now();
+
+        if (action === 'start') {
+          const from = Number(request.body.from);
+          const to = Number(request.body.to);
+          for (const revision of [from, to]) {
+            if (!existsSync(join(context.options.workspace, 'models', graph, `v${revision}.json`))) {
+              throw new HttpError(404, 'no-revision', `there is no published revision v${revision} for '${graph}'`,
+                'POST /v1/semantic/publish to create one, or point from/to at snapshots that exist');
+            }
+          }
+          try {
+            return store.start({
+              from, to, canaryPct: Number(request.body.canaryPct ?? 10),
+              actor: request.principal.actor, now,
+              ...(typeof request.body.question === 'string' ? { probeQuestion: request.body.question } : {}),
+            });
+          } catch (error) {
+            throw new HttpError(409, 'release-conflict', (error as Error).message);
+          }
+        }
+
+        if (action === 'promote') {
+          const config = store.get();
+          if (!config) throw new HttpError(409, 'no-release', `no release for '${graph}'`);
+          // the probe question is compared across the two revisions before the promotion is allowed
+          let shadow: 'promote' | 'hold' | undefined;
+          const question = typeof request.body.question === 'string' ? request.body.question : config.probeQuestion;
+          if (question) {
+            const before = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.fromRevision}.json`));
+            const after = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.toRevision}.json`));
+            if (before?.candidates && after?.candidates) {
+              shadow = withDatabase(context, (run) => shadowAsk({
+                question, previous: before.candidates, next: after.candidates, run,
+                revisions: { from: config.fromRevision, to: config.toRevision },
+              })).verdict;
+            }
+          }
+          if (!shadow) {
+            const before = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.fromRevision}.json`));
+            const after = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.toRevision}.json`));
+            if (before?.candidates && after?.candidates) {
+              const diff = diffModels(before.candidates, after.candidates, { from: config.fromRevision, to: config.toRevision });
+              if (diff.verdict === 'breaking') {
+                throw new HttpError(409, 'promotion-refused',
+                  `v${config.toRevision} changes ${diff.summary.breaking} definition(s); a breaking release needs a shadow question`,
+                  'POST /v1/semantic/release {action:"promote", question:"..."} so the numbers are compared before promotion');
+              }
+            }
+          }
+          try {
+            return store.promote({ actor: request.principal.actor, now, ...(shadow ? { shadow } : {}) });
+          } catch (error) {
+            throw new HttpError(409, 'promotion-refused', (error as Error).message,
+              'GET /v1/semantic/release shows the canary evidence; more traffic or a fix is what unblocks it');
+          }
+        }
+
+        if (action === 'rollback') {
+          try {
+            return store.rollback({ actor: request.principal.actor, reason: String(request.body.reason ?? ''), now });
+          } catch (error) {
+            throw new HttpError(400, 'rollback-needs-a-reason', (error as Error).message);
+          }
+        }
+
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use start, promote or rollback');
       },
     },
     {
@@ -750,11 +839,22 @@ function buildRoutes(): RouteDef[] {
           });
         }
         const sessionsBefore = sessions.size;
+        const routing = canaryRoute(context, graph, request.principal.actor, question);
         const result = await withDatabaseAsync(context, async (run) => {
-          const session = new AskSession({ index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()) });
+          const session = new AskSession({
+            index: routing.index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()),
+          });
           const answer = await session.ask(question);
           return { answer, turn: session.turns[session.turns.length - 1]! };
+        }).catch((error) => {
+          // a canary failure is recorded and re-raised, never answered from the stable side
+          throw canaryFailure(context, routing, error);
         });
+        if (routing.side === 'canary') {
+          routing.store!.record({
+            kind: 'answer', revision: routing.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
+          });
+        }
         const sessionId = `s${Date.now().toString(36)}${(sessionsBefore % 1296).toString(36)}`;
         sessions.set(sessionId, { turn: result.turn, touched: Date.now() });
         // evict the least recently used conversation: the limit is a guard, not a feature
@@ -866,7 +966,12 @@ function buildRoutes(): RouteDef[] {
         const issues = validateWriteback(payload, built.allocation, options);
         const adapter = writebackAdapter(context, platform);
         return withDatabaseAsync(context, async () => {
-          const receipt = await submitWriteback(payload, adapter, { commit, now: context.options.now() });
+          const receipt = await submitWriteback(payload, adapter, {
+            commit, now: context.options.now(),
+            // our own record of what was committed: the platform's deduplication is a promise, not a check
+            store: new IdempotencyStore(context.options.workspace),
+            actor: request.principal.actor,
+          });
           return {
             platform, commit, budget: built.budget,
             payload: { ...payload, checks: payload.checks },
@@ -945,6 +1050,68 @@ function executeRisk(context: Context, options: Record<string, unknown>): unknow
   }));
 }
 
+
+
+/**
+ * Which revision this request is served from, and the index that goes with it.
+ *
+ * A running release splits traffic by a sticky bucket; the canary side loads the snapshot of `toRevision`. Everything
+ * else - no release, a rolled-back one - is the current build, which is also what `modelRevision` reports.
+ */
+function canaryRoute(context: Context, graph: string, actor: string, question: string): {
+  index: ModelIndex;
+  revision: number | null;
+  side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none';
+  store?: ReleaseStore;
+} {
+  const store = new ReleaseStore(context.options.workspace, graph);
+  const config = store.get();
+  const picked = pickRevision(config, actor, question);
+  if (picked.revision === 'stable' || !config) return { index: loadModel(context, graph).index, revision: null, side: picked.side };
+  const snapshot = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.toRevision}.json`));
+  if (!snapshot?.candidates) {
+    // a release whose snapshot disappeared is a broken release: say so instead of quietly serving the stable side
+    throw new HttpError(409, 'canary-revision-missing',
+      `the canary points at v${config.toRevision}, but that snapshot is gone`,
+      'roll the release back: POST /v1/semantic/release {action:"rollback", reason:"..."}');
+  }
+  return { index: indexModel(snapshot.candidates), revision: config.toRevision, side: picked.side, store };
+}
+
+/** Records the outcome of a canary request and rolls back automatically after repeated failures. */
+function canaryFailure(context: Context, route: { side: string; revision: number | null; store?: ReleaseStore }, error: unknown): unknown {
+  if (route.side !== 'canary' || !route.store) return error;
+  route.store.record({ kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: 'unknown', detail: (error as Error).message.slice(0, 300) });
+  route.store.autoRollbackAfterErrors({ actor: 'canary-guard' });
+  return error;
+}
+
+/** Runs `fn` against the canary index when the bucket says so, and records the outcome either way. */
+function withCanary<T>(request: Request, context: Context, graph: string, question: string,
+  fn: (chosen: { index: ModelIndex; revision: number | null }) => T): T {
+  const route = canaryRoute(context, graph, request.principal.actor, question);
+  try {
+    const result = fn({ index: route.index, revision: route.revision });
+    if (route.side === 'canary') {
+      const shaped = result as unknown as { refusals?: unknown[]; plan?: unknown } | null;
+      const refused = typeof shaped === 'object' && shaped !== null
+        && Array.isArray(shaped.refusals) && shaped.refusals.length > 0 && shaped.plan === undefined;
+      route.store!.record({
+        kind: refused ? 'error' : 'answer',
+        revision: route.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
+        ...(refused ? { detail: 'the canary revision refused a question the stable revision answers' } : {}),
+      });
+      if (refused) route.store!.autoRollbackAfterErrors({ actor: 'canary-guard' });
+    }
+    return result;
+  } catch (error) {
+    if (route.side === 'canary') {
+      route.store!.record({ kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: request.principal.actor, question, detail: (error as Error).message.slice(0, 300) });
+      route.store!.autoRollbackAfterErrors({ actor: 'canary-guard' });
+    }
+    throw error;
+  }
+}
 
 /** The warehouse as the model sees it, for the drift check. */
 function liveTables(context: Context): LiveTable[] {

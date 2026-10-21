@@ -40,8 +40,9 @@
     "verify:p1ver": "node scripts/verify-p1ver.mjs",
     "verify:p1dec": "node scripts/verify-p1dec.mjs",
     "verify:p1ask": "node scripts/verify-p1ask.mjs",
-    "verify:all": "npm run verify:p0 && npm run verify:m2 && npm run verify:m2q && npm run verify:m2x && npm run verify:m3 && npm run verify:m4 && npm run verify:m5 && npm run verify:m6 && npm run verify:m7 && npm run verify:m8 && npm run verify:p1graph && npm run verify:p1ver && npm run verify:p1dec && npm run verify:p1ask && npm run verify:p1api",
-    "verify:p1api": "node scripts/verify-p1api.mjs"
+    "verify:all": "npm run verify:p0 && npm run verify:m2 && npm run verify:m2q && npm run verify:m2x && npm run verify:m3 && npm run verify:m4 && npm run verify:m5 && npm run verify:m6 && npm run verify:m7 && npm run verify:m8 && npm run verify:p1graph && npm run verify:p1ver && npm run verify:p1dec && npm run verify:p1ask && npm run verify:p1api && npm run verify:p1rel",
+    "verify:p1api": "node scripts/verify-p1api.mjs",
+    "verify:p1rel": "node scripts/verify-p1rel.mjs"
   },
   "dependencies": {
     "@types/node": "^26.6.5",

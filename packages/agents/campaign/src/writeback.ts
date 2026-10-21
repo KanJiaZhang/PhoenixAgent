@@ -17,6 +17,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { payloadHashOf } from './idempotency.ts';
 import type { AllocationResult } from './optimize.ts';
 
 export interface WritebackCell {
@@ -59,7 +60,8 @@ export interface PlatformAdapter {
 }
 
 export interface WritebackReceipt {
-  status: 'dry-run' | 'committed' | 'rejected';
+  /** `replayed` means the key had already been committed: the stored receipt came back, nothing was sent. */
+  status: 'dry-run' | 'committed' | 'rejected' | 'replayed';
   platform: string;
   idempotencyKey: string;
   sentAt: string;
@@ -216,7 +218,13 @@ export function validateWriteback(payload: WritebackPlan, allocation: Allocation
  * A dry run still asks the adapter to validate, so the platform's own rules are exercised before anything moves;
  * what it does not do is call `commit`. A rejected payload never reaches the adapter's commit at all.
  */
-export async function submitWriteback(payload: WritebackPlan, adapter: PlatformAdapter, options: { commit?: boolean; now?: string } = {}): Promise<WritebackReceipt> {
+export async function submitWriteback(payload: WritebackPlan, adapter: PlatformAdapter, options: {
+  commit?: boolean;
+  now?: string;
+  /** When present, a key already committed is replayed instead of sent again. */
+  store?: import('./idempotency.ts').IdempotencyStore;
+  actor?: string;
+} = {}): Promise<WritebackReceipt> {
   const sentAt = options.now ?? new Date().toISOString();
   // Re-derive the payload's arithmetic instead of trusting the checks it shipped with: a number edited between
   // build and submit would otherwise carry the original "ok" all the way to the platform.
@@ -236,7 +244,33 @@ export async function submitWriteback(payload: WritebackPlan, adapter: PlatformA
   if (options.commit !== true) {
     return { status: 'dry-run', platform: adapter.name, idempotencyKey: payload.idempotencyKey, sentAt, cells: payload.cells.length, proposedSpend: payload.totals.proposedSpend, issues: [] };
   }
+
+  // the platform's deduplication is a promise; this is the check
+  const replay = options.store?.check(payload);
+  if (replay?.conflict) {
+    return {
+      status: 'rejected', platform: adapter.name, idempotencyKey: payload.idempotencyKey, sentAt,
+      cells: payload.cells.length, proposedSpend: payload.totals.proposedSpend,
+      issues: [{ code: 'key-mismatch', detail: replay.conflict }],
+    };
+  }
+  if (replay?.decision === 'replay' && replay.record) {
+    return {
+      status: 'replayed', platform: adapter.name, idempotencyKey: payload.idempotencyKey,
+      sentAt: options.now ?? replay.record.at,
+      cells: payload.cells.length, proposedSpend: replay.record.proposedSpend, issues: [],
+      ...(replay.record.receiptId ? { receiptId: replay.record.receiptId } : {}),
+      ...(replay.record.acceptedAt ? { acceptedAt: replay.record.acceptedAt } : {}),
+    };
+  }
+
   const result = await adapter.commit(payload);
+  options.store?.record({
+    key: payload.idempotencyKey, platform: adapter.name, status: 'committed',
+    receiptId: result.receiptId, acceptedAt: result.acceptedAt,
+    payloadHash: payloadHashOf(payload), at: result.acceptedAt, actor: options.actor ?? 'unknown',
+    cells: payload.cells.length, proposedSpend: payload.totals.proposedSpend,
+  });
   return {
     status: 'committed', platform: adapter.name, idempotencyKey: payload.idempotencyKey, sentAt,
     cells: payload.cells.length, proposedSpend: payload.totals.proposedSpend, issues: [],

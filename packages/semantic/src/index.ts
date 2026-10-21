@@ -18,6 +18,8 @@ export { publish, buildSchemaDraft } from './publish.ts';
 export type { PublishResult } from './publish.ts';
 export { build, buildModel, rebuildReport, loadBuild, readSources, nextModelVersion, diffCandidates } from './pipeline.ts';
 export { diffModels, driftReport, shadowAsk, releaseGate, modelCounts } from './version.ts';
+export { ReleaseStore, bucketOf, pickRevision } from './release.ts';
+export type { ReleaseConfig, ReleaseEvent, PromoteDecision, PromoteOptions } from './release.ts';
 export type { ModelDiff, Change, Compatibility, DriftReport, DriftIssue, LiveTable, ShadowResult, ModelCounts, ReleaseDecision } from './version.ts';
 export { interpret, translate, ask, requestedGrain } from './ask/index.ts';
 export type { QuerySpec, Interpretation, SemanticPlan, AskResult, TranslateResult } from './ask/index.ts';
