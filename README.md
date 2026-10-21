@@ -20,7 +20,8 @@
 | **M2.5** 语义层问数面：确定性解释器 + translate/ask/validate + yoy/top-N | ✅ 完成 | `npm run verify:m2q` → 40/40 |
 | **M2.6** 跨事实表指标（两侧先聚合再组合）+ 域边界 scope | ✅ 完成 | `npm run verify:m2x` → 37/37 |
 | **P7 / M8** 产品面：HTTP API（24 路由/三角色/确认令牌/审计）、Console、MCP、compose | ✅ 完成 | `npm run verify:m8` → 69/69 |
-**八个阶段 + 语义问数面 + 跨事实指标全部交付**：415 条验收断言。
+| **P1 升级（图 / 版本 / 决策平台 / 混合问数）** 图特征进 AUC 对比、模型 diff+漂移+shadow、规则冲突+容量+双签+下发、提案校验+词表学习+多轮 | ✅ 完成 | `npm run verify:p1graph/p1ver/p1dec/p1ask`；见 [docs/P1-UPGRADE.md](docs/P1-UPGRADE.md) |
+**八个阶段 + 语义问数面 + 跨事实指标 + P1 升级全部交付**：563 条验收断言（14 套）。
 
 规划：[docs/PLAN.md](docs/PLAN.md)。P0+P1 的实现笔记与三处与规划的偏差：[docs/P1-NOTES.md](docs/P1-NOTES.md)。
 
@@ -36,6 +37,11 @@ npm run verify:m5    # 归因：循环下钻 → 批量取证 → 精确分解 �
 npm run verify:m6    # 投放：拟合曲线 → 边际分配 → holdout 可行性
 npm run verify:m7    # 风控：趋势 → 特征有效性 → 规则 → 回测 → 审批
 npm run verify:m8    # 产品面：路由目录 → 角色 → 确认令牌 → 三个工作台 → MCP → 审计
+npm run verify:p1graph # 图特征：PIT 快照 → 结构特征 → AUC 增量 → （可选）基座遍历对账
+npm run verify:p1ver   # 模型版本：变更分级 → 漂移对账 → shadow → 发布门
+npm run verify:p1dec   # 决策平台：规则冲突/容量/双签/下发幂等
+npm run verify:p1ask   # 混合问数：LLM 提案 → 确定性校验 → 词表学习 → 多轮
+npm run verify:all     # 上面 14 套串跑
 
 npm run serve        # 起 HTTP 服务 + Console（默认 :8790，未配 key 会打印一个）
 

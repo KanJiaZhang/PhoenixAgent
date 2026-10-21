@@ -12,3 +12,5 @@ export type { AllocationResult, AllocatedCell, AllocationBounds, AllocationCell,
 export { proposeHoldout } from './holdout.ts';
 export type { HoldoutDesign, HoldoutCandidate } from './holdout.ts';
 export { narrate } from './narrate.ts';
+export { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, checkPayload } from './writeback.ts';
+export type { WritebackPlan, WritebackCell, WritebackReceipt, PlatformAdapter, ValidationIssue, WritebackOptions } from './writeback.ts';

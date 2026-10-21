@@ -35,7 +35,12 @@
     "example:growth": "node examples/attribution-campaign.mjs",
     "example:audit": "node examples/risk-rule-audit.mjs",
     "example:stoploss": "node examples/growth-stop-loss.mjs",
-    "examples": "node examples/risk-strategy.mjs && node examples/risk-rule-audit.mjs && node examples/attribution-campaign.mjs && node examples/growth-stop-loss.mjs"
+    "examples": "node examples/risk-strategy.mjs && node examples/risk-rule-audit.mjs && node examples/attribution-campaign.mjs && node examples/growth-stop-loss.mjs",
+    "verify:p1graph": "node scripts/verify-p1graph.mjs",
+    "verify:p1ver": "node scripts/verify-p1ver.mjs",
+    "verify:p1dec": "node scripts/verify-p1dec.mjs",
+    "verify:p1ask": "node scripts/verify-p1ask.mjs",
+    "verify:all": "npm run verify:p0 && npm run verify:m2 && npm run verify:m2q && npm run verify:m2x && npm run verify:m3 && npm run verify:m4 && npm run verify:m5 && npm run verify:m6 && npm run verify:m7 && npm run verify:m8 && npm run verify:p1graph && npm run verify:p1ver && npm run verify:p1dec && npm run verify:p1ask"
   },
   "dependencies": {
     "@types/node": "^26.6.5",

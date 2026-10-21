@@ -10,3 +10,6 @@ export { interpret, requestedGrain } from './interpret.ts';
 export type { QuerySpec, Interpretation, PeriodSpec, PeriodGrain } from './interpret.ts';
 export { translate, ask } from './query.ts';
 export type { TranslateRequest, TranslateResult, SemanticPlan, AskResult } from './query.ts';
+
+export { askHybrid, validateProposal, buildPrompt, applyLexicon, learnWord, loadLexicon, lexiconPath, AskSession } from './hybrid.ts';
+export type { HybridAsk, HybridAskOptions, Proposal, ProposalGateway, Repair, LexiconEntry, Turn } from './hybrid.ts';

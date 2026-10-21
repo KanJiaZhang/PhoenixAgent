@@ -72,6 +72,8 @@ export interface Move {
 
 export interface AllocationResult {
   budget: number;
+  /** What the loop optimised: revenue (fixed budget) or profit (spend may fall). */
+  objective: 'revenue' | 'profit';
   cells: AllocatedCell[];
   moves: Move[];
   iterations: number;
@@ -227,6 +229,7 @@ export function allocate(cells: AllocationCell[], bounds: AllocationBounds,
 
   return {
     budget: round(budget),
+    objective,
     cells: allocated,
     moves,
     iterations,

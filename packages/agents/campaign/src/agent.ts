@@ -382,7 +382,7 @@ function empty(options: CampaignOptions, index: ModelIndex, counter: { queries: 
     window: { periods: 0, first: '', last: '' },
     budget: 0,
     allocation: {
-      budget: 0, cells: [], moves: [], iterations: 0, boundHit: false,
+      budget: 0, objective: 'revenue', cells: [], moves: [], iterations: 0, boundHit: false,
       totals: {
         currentSpend: 0, proposedSpend: 0, expectedRevenueCurrent: 0, expectedRevenueProposed: 0,
         expectedRevenueDelta: 0, expectedProfitCurrent: 0, expectedProfitProposed: 0, expectedProfitDelta: 0,

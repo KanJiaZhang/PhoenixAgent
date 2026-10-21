@@ -149,6 +149,64 @@ const gaussian = () => {
 };
 const logistic = (z) => 1 / (1 + Math.exp(-z));
 
+/**
+ * A second, independent random stream: FNV-1a over a label, so entity assignment never consumes `random()`.
+ *
+ * That independence is the whole point. The risk corpus below is quoted by number in a dozen documents and
+ * assertions (15,188 events, 449 frauds, z = 6.042); inserting extra `random()` calls would shift every label
+ * after the first event and silently invalidate all of them. Hashing the event id instead leaves the label stream
+ * byte-for-byte identical while still giving each event a stable account/device/IP.
+ */
+const hashUnit = (text) => {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index++) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash / 4294967296;
+};
+
+// The entity graph: a home device per account (1:1), a shared-device pool, and a "ring" - a handful of devices and
+// IPs that a small set of accounts share. Fraud events are routed onto the ring with probability RING_SHARE, which
+// is a *planted* correlation: it makes graph features predictive by construction, so the point of the fixture is the
+// pipeline (point-in-time snapshots, cross-check, measured increment), not a claim about the wild. See docs/P1-UPGRADE.md.
+const ACCOUNT_COUNT = 4200;
+const RING_ACCOUNTS = 80;
+const RING_DEVICES = 5;
+const RING_IPS = 3;
+const RING_SHARE = 0.45;
+// Ordinary accounts live 1:1 with their device and IP. A small amount of sharing (a family tablet, a NAT) is normal
+// noise; the earlier 8% on a 300-device pool merged 1,200 accounts into one component and drowned the ring.
+const SHARED_DEVICE_SHARE = 0.02;
+const SHARED_IP_SHARE = 0.01;
+// A few legitimate events also touch the ring's devices (mules share devices with their victims): the ring must be a
+// neighbourhood, not a perfect label.
+const RING_TOUCH_SHARE = 0.05;
+const accountId = (index) => `A${String(index).padStart(5, '0')}`;
+const deviceId = (index) => `D${String(index).padStart(5, '0')}`;
+const ipId = (index) => `IP${String(index).padStart(4, '0')}`;
+
+/** The entity an event came from: ring accounts for half the frauds, a home device for everyone else. */
+function entityOf(eventId, isFraud) {
+  const ringDraw = hashUnit(`${eventId}|ring`);
+  const onRing = (isFraud === 1 && ringDraw < RING_SHARE) || ringDraw < RING_TOUCH_SHARE;
+  if (onRing) {
+    return {
+      account_id: accountId(Math.floor(hashUnit(`${eventId}|ring-account`) * RING_ACCOUNTS)),
+      device_id: deviceId(Math.floor(hashUnit(`${eventId}|ring-device`) * RING_DEVICES)),
+      ip_id: ipId(Math.floor(hashUnit(`${eventId}|ring-ip`) * RING_IPS)),
+    };
+  }
+  const index = RING_ACCOUNTS + Math.floor(hashUnit(`${eventId}|account`) * (ACCOUNT_COUNT - RING_ACCOUNTS));
+  const sharedDevice = hashUnit(`${eventId}|shared-device`) < SHARED_DEVICE_SHARE;
+  const sharedIp = hashUnit(`${eventId}|shared-ip`) < SHARED_IP_SHARE;
+  return {
+    account_id: accountId(index),
+    device_id: deviceId(sharedDevice ? 10000 + (index % 600) : index),
+    ip_id: ipId(sharedIp ? 5000 + (index % 300) : index),
+  };
+}
+
 const riskEvents = [];
 const featureRows = [];
 let eventSeq = 1;
@@ -181,9 +239,11 @@ for (const month of months) {
     const isFraud = random() < logistic(baseline) ? 1 : 0;
     const labelDate = `${month}-${String(Math.min(28, day + 7 + ((random() * 20) | 0))).padStart(2, '0')}`;
 
+    const entity = entityOf(eventId, isFraud);
     riskEvents.push({
       event_id: eventId, event_date: eventDate, region_id: region.id, channel_id: channel.id,
       amount, is_fraud: isFraud, label_date: labelDate,
+      account_id: entity.account_id, device_id: entity.device_id, ip_id: entity.ip_id,
     });
 
     // A blacklist hit is the kind of high-precision, low-recall signal a real stack has: it is known *before*
@@ -306,8 +366,8 @@ insertMany(
   ['order_id', 'order_date', 'region_id', 'industry_id', 'amount', 'refund_amount', 'status'],
   orderRows,
 );
-insertMany('INSERT INTO risk_event (event_id, event_date, region_id, channel_id, amount, is_fraud, label_date) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ['event_id', 'event_date', 'region_id', 'channel_id', 'amount', 'is_fraud', 'label_date'], riskEvents);
+insertMany('INSERT INTO risk_event (event_id, event_date, region_id, channel_id, amount, account_id, device_id, ip_id, is_fraud, label_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ['event_id', 'event_date', 'region_id', 'channel_id', 'amount', 'account_id', 'device_id', 'ip_id', 'is_fraud', 'label_date'], riskEvents);
 insertMany('INSERT INTO feature_registry (feature_name, entity, window, data_type, owner, freshness_hours, coverage, available_before_event) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
   ['feature_name', 'entity', 'window', 'data_type', 'owner', 'freshness_hours', 'coverage', 'available_before_event'], featureRegistry);
 insertMany('INSERT INTO feature_snapshot (event_id, feature_name, as_of_date, value) VALUES (?, ?, ?, ?)',

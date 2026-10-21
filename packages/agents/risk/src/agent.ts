@@ -314,28 +314,79 @@ export function riskAgent(options: RiskOptions): RiskResult {
  */
 export class RiskApprovals {
   readonly path: string;
-  constructor(workspace: string, graph: string) {
+  /** Distinct signatures a decision needs. One is the default; a retirement may need two. */
+  readonly quorum: number;
+  constructor(workspace: string, graph: string, options: { quorum?: number } = {}) {
     this.path = join(workspace, 'risk', `${graph}.approvals.jsonl`);
+    this.quorum = Math.max(1, options.quorum ?? 1);
   }
 
   all(): Approval[] {
     return readJsonl<Approval>(this.path);
   }
 
-  decisions(): Map<string, { decision: 'approve' | 'reject'; actor: string; ts: string; note: string }> {
-    const map = new Map<string, { decision: 'approve' | 'reject'; actor: string; ts: string; note: string }>();
-    for (const entry of this.all()) {
-      map.set(entry.ruleId, { decision: entry.decision, actor: entry.actor, ts: entry.ts, note: entry.note });
-    }
-    return map;
+  /** Every signature for a rule, in order, with the actor named - the raw material for "who agreed, and when". */
+  signatures(ruleId: string): Approval[] {
+    return this.all().filter((entry) => entry.ruleId === ruleId);
   }
 
-  decide(ruleId: string, expression: string, decision: 'approve' | 'reject', actor: string,
+  /** How far a rule is from a decision: the distinct signers and what is still missing. */
+  state(ruleId: string): { decision: 'approve' | 'reject' | null; signers: string[]; satisfied: boolean; required: number } {
+    const entries = this.signatures(ruleId);
+    const signers = [...new Set(entries.filter((entry) => entry.decision === 'approve').map((entry) => entry.actor))];
+    const rejected = entries.some((entry) => entry.decision === 'reject');
+    return {
+      decision: rejected ? 'reject' : signers.length >= this.quorum ? 'approve' : null,
+      signers,
+      satisfied: rejected || signers.length >= this.quorum,
+      required: this.quorum,
+    };
+  }
+
+  /**
+   * One signature. The same person signing twice is one signature, not two: a quorum of two actors who are the same
+   * actor is not a control, and the log has to be the place that refuses it rather than the caller remembering to.
+   */
+  sign(ruleId: string, expression: string, decision: 'approve' | 'reject', actor: string,
     note: string, now = new Date().toISOString()): Approval {
     if (actor.trim().length === 0) throw new Error('an approval needs an actor: the log is the audit trail');
+    const existing = this.signatures(ruleId);
+    if (decision === 'approve' && existing.some((entry) => entry.decision === 'approve' && entry.actor === actor)) {
+      throw new Error(`${actor} has already approved ${ruleId}: a second signature from the same person is not a second signature`);
+    }
     const entry: Approval = { ts: now, actor, ruleId, decision, expression, note };
     appendJsonl(this.path, entry);
     return entry;
+  }
+
+  /** Records a signature and returns the decision once the quorum is met (a rejection is immediate). */
+  decide(ruleId: string, expression: string, decision: 'approve' | 'reject', actor: string,
+    note: string, now = new Date().toISOString()): Approval {
+    return this.sign(ruleId, expression, decision, actor, note, now);
+  }
+
+  /**
+   * The published set: a rule is published only when its quorum is met and it was not rejected.
+   * Deriving this from the log (rather than a mutable status) is what makes the quorum checkable after the fact.
+   */
+  decisions(): Map<string, { decision: 'approve' | 'reject'; actor: string; ts: string; note: string }> {
+    const map = new Map<string, { decision: 'approve' | 'reject'; actor: string; ts: string; note: string }>();
+    const rules = new Set(this.all().map((entry) => entry.ruleId));
+    for (const ruleId of rules) {
+      const state = this.state(ruleId);
+      if (!state.satisfied || state.decision === null) continue;
+      const entries = this.signatures(ruleId);
+      const deciding = state.decision === 'reject'
+        ? entries.find((entry) => entry.decision === 'reject')!
+        : entries.filter((entry) => entry.decision === 'approve').at(-1)!;
+      map.set(ruleId, {
+        decision: state.decision,
+        actor: state.signers.join(' + '),
+        ts: deciding.ts,
+        note: deciding.note,
+      });
+    }
+    return map;
   }
 }
 

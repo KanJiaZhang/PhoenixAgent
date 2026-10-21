@@ -8,10 +8,13 @@ CREATE TABLE risk_event (
   region_id     INTEGER      NOT NULL COMMENT '大区（复用 dim_region）',
   channel_id    INTEGER      NOT NULL COMMENT '渠道（复用 dim_channel）',
   amount        DECIMAL(15,2) NOT NULL COMMENT '交易金额',
+  account_id    VARCHAR(32)  NOT NULL COMMENT '账户 id：实体图里的 Account 节点',
+  device_id     VARCHAR(32)  NOT NULL COMMENT '设备 id：Account-[UsesDevice]->Device',
+  ip_id         VARCHAR(32)  NOT NULL COMMENT 'IP id：Device-[SharesIp]->Ip',
   is_fraud      INTEGER      NOT NULL COMMENT '是否欺诈（调查结论，0/1）',
   label_date    DATE         NOT NULL COMMENT '标签确认日期：一定晚于事件日期',
   PRIMARY KEY (event_id)
-) COMMENT '风控事件：标签在事件之后才能被确认，这是 point-in-time 的来源';
+) COMMENT '风控事件：标签在事件之后才能被确认，这是 point-in-time 的来源；account/device/ip 三列是实体图的边，图特征靠它们才可能存在';
 
 CREATE TABLE feature_registry (
   feature_name       VARCHAR(64) NOT NULL,
