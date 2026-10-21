@@ -6,7 +6,7 @@
  * nobody can debug; this one can be read and driven with curl, and the verification drives it the same way.
  */
 
-const state = { lastPlanId: null, model: null };
+const state = { lastPlanId: null, model: null, sessionId: null };
 
 const keyInput = document.getElementById('key');
 keyInput.value = sessionStorage.getItem('pag-key') ?? '';
@@ -135,6 +135,88 @@ document.querySelectorAll('[data-act]').forEach((button) => {
     }
     if (action === 'campaign') return show(document.getElementById('agents-out'), await api('POST', '/v1/campaign/optimize', {}));
     if (action === 'risk') return show(document.getElementById('agents-out'), await api('GET', '/v1/risk/report'));
+
+    // --- P1: release, rule system, graph, hybrid asking, write-back
+    const releaseOut = document.getElementById('release-out');
+    const releaseOut2 = document.getElementById('release-out2');
+    if (action === 'release-version') {
+      const question = document.getElementById('release-question').value;
+      const result = await api('POST', '/v1/semantic/version', { question });
+      if (!result.ok) return show(releaseOut, result);
+      const { diff, drift, shadows, gate } = result.body;
+      const changes = diff.changes.slice(0, 8).map((change) => `<tr><td><code>${escapeHtml(change.id)}</code></td>
+        <td>${escapeHtml(change.kind)} ${escapeHtml(change.field ?? '')}</td>
+        <td class="${change.compatibility === 'breaking' ? 'bad' : change.compatibility === 'behavioural' ? 'warn' : 'ok'}">${escapeHtml(change.compatibility)}</td>
+        <td class="muted">${escapeHtml(change.reason)}</td></tr>`).join('');
+      releaseOut.innerHTML = `<div class="row"><span class="pill">diff ${escapeHtml(diff.verdict)}</span>
+        <span class="pill">漂移 ${escapeHtml(drift.verdict)}（${drift.blocking} 阻塞）</span>
+        <span class="pill">shadow ${escapeHtml(shadows[0]?.verdict ?? '未跑')}</span>
+        <span class="pill ${gate.verdict === 'promote' ? 'ok' : 'bad'}">发布门 ${escapeHtml(gate.verdict)}</span></div>`
+        + `<div class="muted">${escapeHtml(gate.reasons.join('；'))}</div>`
+        + (changes ? `<table><thead><tr><th>对象</th><th>变更</th><th>级别</th><th>理由</th></tr></thead><tbody>${changes}</tbody></table>` : '<div class="muted">本次构建与上一个版本没有差异。</div>');
+      return;
+    }
+    if (action === 'release-shadow') {
+      const question = document.getElementById('release-question').value;
+      return show(releaseOut, await api('POST', '/v1/semantic/shadow', { question }));
+    }
+    if (action === 'release-conflicts') {
+      const result = await api('POST', '/v1/risk/conflicts', { months: 6 });
+      if (!result.ok) return show(releaseOut2, result);
+      const { rules, duplicates, unreachable, union, pairs } = result.body;
+      const rows = rules.map((rule) => '<tr><td><code>' + escapeHtml(rule.ruleId) + '</code></td>' +
+        '<td>' + rule.hits + '</td><td>' + rule.precision + '</td><td>' + rule.lonePositives + '</td>' +
+        '<td class="' + (rule.verdict === 'keep' ? 'ok' : 'warn') + '">' + escapeHtml(rule.verdict) + '</td>' +
+        '<td class="muted">' + escapeHtml(rule.reasons.join('；')) + '</td></tr>').join('');
+      const overlapping = pairs.filter((pair) => pair.both > 0).map((pair) => pair.a + '/' + pair.b + ' 共命中 ' + pair.both).join('；');
+      releaseOut2.innerHTML = '<div class="row"><span class="pill">并集召回 ' + (union.recall * 100).toFixed(1) + '%</span>' + 
+        '<span class="pill">重复 ' + duplicates.length + '</span><span class="pill">不可达 ' + unreachable.length + '</span></div>' +
+        '<div class="muted">' + escapeHtml(overlapping || '没有规则重叠') + '</div>' +
+        '<table><thead><tr><th>规则</th><th>命中</th><th>精确率</th><th>独占正例</th><th>判定</th><th>理由</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      return;
+    }
+    if (action === 'release-capacity') {
+      const result = await api('POST', '/v1/risk/capacity', {
+        hitsPerDay: Number(document.getElementById('cap-hits').value),
+        minutesPerReview: Number(document.getElementById('cap-minutes').value),
+        reviewers: Number(document.getElementById('cap-people').value),
+      });
+      return show(releaseOut2, result);
+    }
+    if (action === 'release-graph') {
+      show(releaseOut2, { status: '计算中（约 5 秒）…' }, false);
+      const result = await api('POST', '/v1/graph/features', { cutoff: '2025-07' });
+      if (!result.ok) return show(releaseOut2, result);
+      return show(releaseOut2, {
+        increment: result.body.models.increment,
+        base: result.body.models.base.auc, withGraph: result.body.models.withGraph.auc,
+        features: result.body.features.map((feature) => ({ name: feature.name, auc: feature.auc })),
+        snapshot: result.body.snapshot, labelIndependence: result.body.labelIndependence, limits: result.body.limits,
+      });
+    }
+    if (action === 'hybrid-ask') {
+      const question = document.getElementById('hybrid-question').value;
+      const result = await api('POST', '/v1/ask/hybrid', { question });
+      if (result.ok) state.sessionId = result.body.sessionId;
+      return show(releaseOut2, result);
+    }
+    if (action === 'hybrid-follow') {
+      const question = document.getElementById('hybrid-follow').value;
+      if (!state.sessionId) return show(releaseOut2, { error: '先问一次，拿到 sessionId' });
+      return show(releaseOut2, await api('POST', '/v1/ask/hybrid', { question, sessionId: state.sessionId, followUp: true }));
+    }
+    if (action === 'wb-dry') {
+      const budget = Number(document.getElementById('wb-budget').value);
+      return show(releaseOut2, await api('POST', '/v1/campaign/writeback', { budget }));
+    }
+    if (action === 'wb-commit') {
+      const budget = Number(document.getElementById('wb-budget').value);
+      const confirmed = await api('POST', '/v1/campaign/writeback', { budget, commit: true, mode: 'confirm' });
+      if (!confirmed.ok) return show(releaseOut2, confirmed);
+      if (!confirmed.body.token) return show(releaseOut2, confirmed);
+      const result = await api('POST', '/v1/campaign/writeback', { budget, commit: true, confirmToken: confirmed.body.token });
+      return show(releaseOut2, { tokenIssuedFor: confirmed.body.planHash, commit: result });
+    }
   });
 });
 

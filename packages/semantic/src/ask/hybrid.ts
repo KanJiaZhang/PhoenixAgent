@@ -347,6 +347,17 @@ export class AskSession {
     return this.turns[this.turns.length - 1] ?? null;
   }
 
+  /**
+   * Re-seeds the conversation with a turn from a previous request.
+   *
+   * A session must not hold a database connection - the connection is per request - so the conversation is rebuilt
+   * around the last turn each time. That is also what keeps "the follow-up only changes one thing" honest: the state
+   * is a QuerySpec, not a hidden conversation buffer.
+   */
+  restore(turn: Turn): void {
+    this.turns.push(turn);
+  }
+
   async ask(question: string): Promise<HybridAsk> {
     const result = await askHybrid({ ...this.options, question });
     this.turns.push({ question, spec: result.spec, ...(result.answer ? { answer: result.answer } : {}) });

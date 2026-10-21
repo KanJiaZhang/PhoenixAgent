@@ -257,7 +257,8 @@ npm run verify:p1graph    # 28/28（PAGENT_GRAPH_CROSSCHECK=1 时 29/29，并写
 npm run verify:p1ver      # 33/33
 npm run verify:p1dec      # 45/45
 npm run verify:p1ask      # 42/42
-npm run verify:all        # 14 套串跑
+npm run verify:p1api      # 105/105（起真实服务 + 一个本地"平台"端点）
+npm run verify:all        # 15 套串跑
 npx tsc --noEmit -p tsconfig.json
 ```
 
@@ -267,12 +268,51 @@ npx tsc --noEmit -p tsconfig.json
 | `verify:p1ver` | 33 | 五类变更分级、消费者清单、漂移三例、shadow 10%、门的四种组合 |
 | `verify:p1dec` | 45 | 重复/子集/冲突/不可达、Erlang 单调与饱和、双签、幂等键、手改被抓 |
 | `verify:p1ask` | 42 | 六种提案、降级声明、词表学习与冲突、三轮跟进、确定性 |
+| `verify:p1api` | 105 | 9 条路由的目录与角色、只读/写入边界（403/428/501）、令牌绑定、幂等键跨干跑与提交一致、审计覆盖、Console 调用同一端点、API 合计与手写 SQL 对账 |
 
 ---
 
-## 6. 还没做（下一轮）
+## 6. 接口面：四个模块上了线（P1-e）
 
-1. **接口层没接**：这四个模块目前是库 + 验收脚本，**没有暴露到 `/v1`**（路由、角色、确认令牌、审计、Console、MCP 都还没连）。这是 P1 之后最直接的下一步。
+九个新路由，全部沿用既有三件事：角色、确认令牌、逐请求审计。目录 `/v1/tools` 仍然由路由表生成，
+所以 MCP（读目录）与 Console 自动看见它们——没有第二份清单。
+
+| 路由 | 角色 | 它做的事 | 需要一个 token 吗 |
+| --- | --- | --- | --- |
+| `POST /v1/semantic/version` | viewer | diff 上一版 → 仓库漂移 → 同一问题 shadow → 发布门 | 否（只读） |
+| `POST /v1/semantic/shadow` | viewer | 两个版本并排跑，返回行级移动与 promote/hold | 否 |
+| `GET /v1/semantic/lexicon` | viewer | 已学过的词 | 否 |
+| `POST /v1/semantic/lexicon` | analyst | 学一个词（目标必须存在；同词不可二指 → 409） | 否（但记 actor） |
+| `POST /v1/ask/hybrid` | viewer | 问题 →（可选）提案 → 确定性校验 → 答案；带 `followUp` 续会话 | 否 |
+| `POST /v1/graph/features` | viewer | 5 个结构特征 + AUC + holdout 增量（约 5 秒） | 否 |
+| `POST /v1/risk/conflicts` | viewer | 规则集：重复/子集/冲突/不可达/边际 | 否 |
+| `POST /v1/risk/capacity` | viewer | Erlang-C 容量，饱和时拒绝估算 | 否 |
+| `POST /v1/campaign/writeback` | analyst | 生成下发载荷；默认干跑 | **提交需要 owner + token** |
+
+三个"读不了就写"的边界，都在服务端而不是文档里：
+
+| 边界 | 行为 |
+| --- | --- |
+| `graph/features {crossCheck:true}` 会写入基座 | **403**（要 owner） |
+| `writeback {commit:true}` 没有 token | **428 `confirm-required`**，返回同一份 plan 的 token 后再发 |
+| `writeback {commit:true}` 没有平台端点 | **501 `no-writeback-endpoint`**——宁可拒绝，也不伪造一张"已提交"的回执 |
+
+令牌是**绑定到计划本身**的（`planHash`）：预算或 `maxChangePct` 变一个字，旧 token 就失效。
+下发载荷的 `idempotencyKey` 在干跑与提交之间**保持不变**，所以"先看后发"是同一个请求，重放不会变成两笔预算。
+
+Console 多了第五个工作台「发布与决策」：发布检查、规则冲突表、容量、图特征、混合问数与跟进、下发干跑/提交。
+
+### 6.1 接线时抓到的两个 bug
+
+| bug | 现象 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| **分币舍入被当成预算错误** | 36 个 cell 的写入被 `total-mismatch` 拦下，总差 0.18 元 | 校验容差写成 0.01，而 36 次四舍五入最多漂 18 分 | 容差 = `0.005 × cell 数 + 0.01`，并把理由写进代码 |
+| 触边被误判为越界 | 恰好 +50% 的 cell 报 "move 0.5 exceeds 0.5" | 先舍入到分再算比例，得到 1.5000000000000002 | 引入 `BOUND_EPSILON = 1e-6` |
+
+另外改了一处 **HTTP 语义**：agent 拒绝给出方案（例如把预算砍到 200 万会让收入损失超过噪声）时，
+路由返回 **409 `agent-refused`** 并带 agent 自己的理由，而不是返回一个 cell 为空、键却合法的载荷。
+
+## 7. 还没做（下一轮）
 2. 图特征的**按周快照**与标签传播（后者要单独设计泄漏防护）。
 3. 真实的灰度：按流量比例路由 + 自动回滚。
 4. 下发适配器的**幂等存储**（本仓库侧记录已发送的键，防止平台不认幂等）。

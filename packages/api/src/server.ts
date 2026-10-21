@@ -23,6 +23,7 @@ import { route } from '../../core/src/router.ts';
 import { assertReadOnly } from '../../dataplane/src/guard.ts';
 import { readSqliteCatalog, sqliteRunner, type QueryRunner } from '../../dataplane/src/sqlite.ts';
 import { indexModel, type ModelIndex } from '../../semantic/src/sql.ts';
+import type { MergedCandidate } from '../../semantic/src/merge.ts';
 import { build, rebuildReport, loadBuild } from '../../semantic/src/pipeline.ts';
 import { ReviewLog } from '../../semantic/src/review.ts';
 import { publish, exportAnalytical } from '../../semantic/src/publish.ts';
@@ -33,7 +34,11 @@ import { advise } from '../../skills/src/advise.ts';
 import { toSkillMarkdown } from '../../skills/src/export.ts';
 import { attribute } from '../../agents/attribution/src/index.ts';
 import { campaign } from '../../agents/campaign/src/index.ts';
-import { riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
+import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
+import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
+import { ask, askHybrid, AskSession, learnWord, loadLexicon, lexiconPath, type Turn } from '../../semantic/src/ask/index.ts';
+import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
+import { createGateway } from '../../core/src/llm.ts';
 import { authenticate, loadAuth, requireRole, Forbidden, Unauthorized, type AuthConfig, type Principal, type Role } from './auth.ts';
 import { ConfirmTokens, ConfirmationRejected } from './confirm.ts';
 
@@ -63,6 +68,13 @@ interface Context {
   config: ReturnType<typeof loadConfig>;
   auditPath: string;
 }
+
+/**
+ * In-memory conversations for /v1/ask/hybrid: the last turn only, so the follow-up can be rebuilt against a fresh
+ * database connection (a session must not hold a closed one). Bounded, because a demo server must not grow forever.
+ */
+const sessions = new Map<string, { turn: Turn; touched: number }>();
+const SESSION_LIMIT = 200;
 
 interface Request {
   method: string;
@@ -292,13 +304,15 @@ function loadModel(context: Context, graph = context.options.graph): {
   index: ModelIndex;
   report: Record<string, unknown> | null;
   candidates: { id: string; status: string; entityType?: string; kind?: string; payload: unknown; note?: string }[];
+  /** The same list untrimmed: the version and shadow tools need the payloads, not a summary. */
+  merged: MergedCandidate[];
 } {
   const stored = loadBuild({ fixtures: context.options.fixtures, graph, workspace: context.options.workspace, now: context.options.now() });
   if (!stored) {
     throw new HttpError(409, 'no-model', `no build for '${graph}'`, `POST /v1/semantic/build {"graph":"${graph}"} first`);
   }
   const report = readJson<Record<string, unknown>>(join(context.options.workspace, 'build', graph, 'report.json'));
-  return { index: indexModel(stored.candidates), report, candidates: stored.candidates };
+  return { index: indexModel(stored.candidates), report, candidates: stored.candidates, merged: stored.candidates };
 }
 
 function requireString(body: Record<string, unknown>, name: string): string {
@@ -640,6 +654,229 @@ function buildRoutes(): RouteDef[] {
       },
     },
     {
+      method: 'POST', path: '/v1/semantic/version', role: 'viewer',
+      summary: 'diff two model revisions, check drift against the warehouse, shadow a question, and gate the release',
+      input: ['graph', 'question', 'from'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { merged: candidates } = loadModel(context, graph);
+        const built = Number(readJson<{ modelVersion?: number }>(join(context.options.workspace, 'build', graph, 'report.json'))?.modelVersion ?? 1);
+        const fromRevision = Number(request.body.from ?? built - 1);
+        const snapshot = readJson<{ candidates: typeof candidates }>(join(context.options.workspace, 'models', graph, `v${fromRevision}.json`));
+        const previous = snapshot?.candidates ?? candidates;
+        const diff = diffModels(previous, candidates, { from: fromRevision, to: built });
+        const drift = driftReport(candidates, liveTables(context));
+        const question = typeof request.body.question === 'string' && request.body.question.trim().length > 0
+          ? request.body.question : null;
+        const shadows = question
+          ? [withDatabase(context, (run) => shadowAsk({ question, previous, next: candidates, run, revisions: { from: fromRevision, to: built } }))]
+          : [];
+        return { graph, diff, drift, shadows, gate: releaseGate({ diff, drift, shadows }) };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/shadow', role: 'viewer',
+      summary: 'the same question under two revisions, with the row-level movement and a promote/hold verdict',
+      input: ['question', 'graph', 'from', 'tolerance'],
+      handler: (request, context) => {
+        const question = requireString(request.body, 'question');
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { merged: candidates } = loadModel(context, graph);
+        const fromRevision = Number(request.body.from ?? 0);
+        const snapshot = readJson<{ candidates: typeof candidates }>(join(context.options.workspace, 'models', graph, `v${fromRevision}.json`));
+        return withDatabase(context, (run) => shadowAsk({
+          question,
+          previous: snapshot?.candidates ?? candidates,
+          next: candidates,
+          run,
+          revisions: { from: fromRevision, to: 0 },
+          ...(request.body.tolerance === undefined ? {} : { tolerance: Number(request.body.tolerance) }),
+        }));
+      },
+    },
+    {
+      method: 'GET', path: '/v1/semantic/lexicon', role: 'viewer',
+      summary: 'the words learned so far (a word is a rewrite, applied before anything parses the question)',
+      input: ['graph'],
+      handler: (request, context) => ({
+        graph: String(request.query.get('graph') ?? context.options.graph),
+        entries: loadLexicon(context.options.workspace, String(request.query.get('graph') ?? context.options.graph)),
+      }),
+    },
+    {
+      method: 'POST', path: '/v1/semantic/lexicon', role: 'analyst',
+      summary: 'learn a word onto a metric or dimension (the target must exist, the word must be new)',
+      input: ['word', 'target', 'graph', 'evidence'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { index } = loadModel(context, graph);
+        let entry;
+        try {
+          entry = learnWord({
+            workspace: context.options.workspace, graph, index,
+            word: requireString(request.body, 'word'), target: requireString(request.body, 'target'),
+            source: 'review', model: request.principal.actor,
+            evidence: String(request.body.evidence ?? ''), now: context.options.now(),
+          });
+        } catch (error) {
+          // a word that already means something, or a target the model does not have: a conflict, not a server fault
+          throw new HttpError(409, 'lexicon-conflict', (error as Error).message,
+            'GET /v1/semantic/lexicon lists what is already learned');
+        }
+        return { entry, path: lexiconPath(context.options.workspace, graph) };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/ask/hybrid', role: 'viewer',
+      summary: 'ask with an optional model proposal, validated deterministically; followUp continues a session',
+      input: ['question', 'sessionId', 'followUp', 'graph'],
+      handler: async (request, context) => {
+        const question = requireString(request.body, 'question');
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { index } = loadModel(context, graph);
+        const gateway = createGateway(context.config.llm);
+        if (request.body.followUp === true) {
+          const id = requireString(request.body, 'sessionId');
+          const entry = sessions.get(id);
+          if (!entry) {
+            throw new HttpError(404, 'no-session', `no session '${id}'`,
+              'ask once without followUp, then resend with the sessionId it returned');
+          }
+          entry.touched = Date.now();
+          return withDatabase(context, (run) => {
+            const session = new AskSession({ index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()) });
+            session.restore(entry.turn);
+            return session.followUp(question);
+          });
+        }
+        const sessionsBefore = sessions.size;
+        const result = await withDatabaseAsync(context, async (run) => {
+          const session = new AskSession({ index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()) });
+          const answer = await session.ask(question);
+          return { answer, turn: session.turns[session.turns.length - 1]! };
+        });
+        const sessionId = `s${Date.now().toString(36)}${(sessionsBefore % 1296).toString(36)}`;
+        sessions.set(sessionId, { turn: result.turn, touched: Date.now() });
+        // evict the least recently used conversation: the limit is a guard, not a feature
+        if (sessions.size > SESSION_LIMIT) {
+          const oldest = [...sessions.entries()].sort((left, right) => left[1].touched - right[1].touched)[0];
+          if (oldest) sessions.delete(oldest[0]);
+        }
+        return { ...result.answer, sessionId };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/graph/features', role: 'viewer',
+      summary: 'structural graph features, their AUC, and the held-out increment over the row features',
+      input: ['cutoff', 'crossCheck'],
+      handler: async (request, context) => {
+        const cutoff = typeof request.body.cutoff === 'string' ? request.body.cutoff : '2025-07';
+        const crossCheck = request.body.crossCheck === true;
+        if (crossCheck && request.principal.role !== 'owner') {
+          // publishing the snapshot writes into PhoenixGraph: that is an owner action, not a read
+          throw new Forbidden('crossCheck publishes a graph into PhoenixGraph and needs the owner role');
+        }
+        const client = crossCheck ? new GraphClient(context.config.phoenix) : undefined;
+        return withDatabaseAsync(context, (run) => graphFeaturesReport({ run, cutoff, ...(client ? { client, crossCheck } : {}) }));
+      },
+    },
+    {
+      method: 'POST', path: '/v1/risk/conflicts', role: 'viewer',
+      summary: 'the rule set as a system: duplicates, subsets, action conflicts, unreachable rules and marginals',
+      input: ['months', 'rules'],
+      handler: (request, context) => withDatabase(context, (run) => {
+        const months = Number(request.body.months ?? 6);
+        const events = loadRiskEvents(run, months);
+        const live = run("SELECT rule_id, expression FROM risk_rule WHERE status = 'active' ORDER BY rule_id").rows;
+        const supplied = Array.isArray(request.body.rules) ? (request.body.rules as Record<string, unknown>[]) : [];
+        const rules = [
+          ...live.map((row) => ({ ruleId: String(row.rule_id), expression: String(row.expression) })),
+          ...supplied
+            .map((row) => ({
+              ruleId: String(row.ruleId ?? ''), expression: String(row.expression ?? ''),
+              ...(typeof row.action === 'string' ? { action: row.action as 'block' | 'review' | 'challenge' } : {}),
+            }))
+            .filter((rule) => rule.ruleId.length > 0 && rule.expression.length > 0),
+        ];
+        return analyseRuleSet({ events, rules });
+      }),
+    },
+    {
+      method: 'POST', path: '/v1/risk/capacity', role: 'viewer',
+      summary: 'how many reviewers a rule volume needs, by Erlang-C, refusing to estimate a saturated queue',
+      input: ['hitsPerDay', 'minutesPerReview', 'reviewers', 'targetServiceLevel', 'slaHours'],
+      handler: (request) => {
+        const target = optionalNumber(request.body, 'targetServiceLevel');
+        const sla = optionalNumber(request.body, 'slaHours');
+        return capacityPlan({
+          hitsPerDay: optionalNumber(request.body, 'hitsPerDay') ?? 0,
+          minutesPerReview: optionalNumber(request.body, 'minutesPerReview') ?? 12,
+          reviewers: optionalNumber(request.body, 'reviewers') ?? 1,
+          ...(target === undefined ? {} : { targetServiceLevel: target }),
+          ...(sla === undefined ? {} : { slaHours: sla }),
+        });
+      },
+    },
+    {
+      method: 'POST', path: '/v1/campaign/writeback', role: 'analyst',
+      summary: 'turn the allocation into a platform payload: dry run by default, commit needs owner + confirm token',
+      input: ['budget', 'maxChangePct', 'platform', 'effectiveFrom', 'commit', 'confirmToken'],
+      handler: (request, context) => {
+        const budget = optionalNumber(request.body, 'budget');
+        const maxChangePct = optionalNumber(request.body, 'maxChangePct');
+        const platform = String(request.body.platform ?? 'dry-run');
+        const commit = request.body.commit === true;
+        const effectiveFrom = String(request.body.effectiveFrom ?? context.options.now().slice(0, 10));
+        const tokenPlan = { budget: budget ?? null, maxChangePct: maxChangePct ?? null, platform, effectiveFrom, commit: true };
+
+        if (commit) {
+          if (request.principal.role !== 'owner') {
+            throw new Forbidden('committing a change to live spend needs the owner role');
+          }
+          const token = request.body.confirmToken;
+          if (typeof token !== 'string' || token.length === 0) {
+            if (request.body.mode === 'confirm') {
+              return { mode: 'confirm', scope: 'writeback', plan: tokenPlan, ...context.tokens.issue(tokenPlan, 'writeback', Date.parse(context.options.now())), note: 'nothing ran; resend with confirmToken to commit' };
+            }
+            throw new HttpError(428, 'confirm-required', 'committing a write-back needs a confirmToken',
+              'call once with mode:"confirm" to receive a token for this exact plan, then resend it');
+          }
+          context.tokens.verify(token, tokenPlan, 'writeback');
+        }
+
+        const built = withDatabase(context, (run) => campaign({
+          run, index: loadModel(context).index,
+          ...(budget === undefined ? {} : { budget }),
+          ...(maxChangePct === undefined ? {} : { maxChangePct }),
+        }));
+        if (built.refusals.length > 0 || built.allocation.cells.length === 0) {
+          // the agent refused to produce a plan (a cut this deep loses more revenue than it saves). There is nothing
+          // honest to write back, so this is a refusal - not an empty payload with a valid-looking key.
+          throw new HttpError(409, 'agent-refused',
+            built.refusals[0]?.message ?? 'the campaign agent returned no cells',
+            built.refusals[0]?.hint ?? 'ask for a budget the agent can justify, or read GET /v1/campaign/optimize first');
+        }
+        const payload = buildWriteback(built.allocation, {
+          platform, effectiveFrom,
+          budget: built.budget,
+          maxChangePct: maxChangePct ?? 0.5,
+          budgetIsCap: built.allocation.totals.proposedSpend < built.budget - 0.01,
+        });
+        const options = { budget: built.budget, maxChangePct: maxChangePct ?? 0.5 };
+        const issues = validateWriteback(payload, built.allocation, options);
+        const adapter = writebackAdapter(context, platform);
+        return withDatabaseAsync(context, async () => {
+          const receipt = await submitWriteback(payload, adapter, { commit, now: context.options.now() });
+          return {
+            platform, commit, budget: built.budget,
+            payload: { ...payload, checks: payload.checks },
+            issues, receipt,
+            status: issues.length > 0 || receipt.status === 'rejected' ? 'blocked' : receipt.status,
+          };
+        });
+      },
+    },
+    {
       method: 'GET', path: '/v1/audit/recent', role: 'owner',
       summary: 'the last N API calls, with actor and status', input: ['limit'],
       handler: (request, context) => {
@@ -706,6 +943,95 @@ function executeRisk(context: Context, options: Record<string, unknown>): unknow
     run, graph: context.options.graph, workspace: context.options.workspace,
     ...(options.holdoutMonths === undefined ? {} : { holdoutMonths: Number(options.holdoutMonths) }),
   }));
+}
+
+
+/** The warehouse as the model sees it, for the drift check. */
+function liveTables(context: Context): LiveTable[] {
+  return withDatabase(context, (_run, catalog) => catalog.tables.map((table) => ({
+    name: table.name,
+    columns: table.columns.map((column) => ({ name: column.name, type: column.dataType })),
+  })));
+}
+
+/** Events with their features over the newest `months` months, shaped for the rule-set analysis. */
+function loadRiskEvents(run: QueryRunner, months: number): Parameters<typeof analyseRuleSet>[0]['events'] {
+  const all = run('SELECT event_id, event_date, amount, is_fraud FROM risk_event ORDER BY event_date, event_id').rows;
+  const dates = [...new Set(all.map((row) => String(row.event_date).slice(0, 7)))].sort();
+  const window = new Set(dates.slice(-Math.max(1, months)));
+  const features = run('SELECT event_id, feature_name, value FROM feature_snapshot').rows;
+  const byEvent = new Map<string, Record<string, number>>();
+  for (const row of features) {
+    const entry = byEvent.get(String(row.event_id)) ?? {};
+    entry[String(row.feature_name)] = Number(row.value);
+    byEvent.set(String(row.event_id), entry);
+  }
+  return all
+    .filter((row) => window.has(String(row.event_date).slice(0, 7)))
+    .map((row) => ({
+      id: String(row.event_id),
+      date: String(row.event_date),
+      window: String(row.event_date).slice(0, 7),
+      label: (Number(row.is_fraud) === 1 ? 1 : 0) as 0 | 1,
+      features: byEvent.get(String(row.event_id)) ?? {},
+      fields: { amount: Number(row.amount) },
+    }));
+}
+
+/** `withDatabase` for a handler that has to await between the read and the answer. */
+async function withDatabaseAsync<T>(context: Context, fn: (run: QueryRunner) => Promise<T> | T): Promise<T> {
+  const dbPath = join(context.options.fixtures, 'data', 'demo.db');
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const runner = sqliteRunner(db, { rowLimit: 200_000, timeoutMs: 60_000 });
+    return await fn((sql: string) => {
+      assertReadOnly(sql);
+      return runner(sql);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Where a write-back goes.
+ *
+ * Without a platform endpoint configured there is nothing honest to commit to: a "committed" receipt that never left
+ * the process would be the exact failure this module exists to prevent. So the dry-run adapter is the default, and a
+ * real commit requires `PAGENT_WRITEBACK_URL` - an endpoint that accepts the payload and returns a receipt.
+ */
+function writebackAdapter(context: Context, platform: string): PlatformAdapter {
+  const url = process.env.PAGENT_WRITEBACK_URL;
+  if (!url) {
+    const dry = dryRunAdapter(platform);
+    return {
+      name: platform,
+      validate: dry.validate,
+      commit: async () => {
+        throw new HttpError(501, 'no-writeback-endpoint',
+          'no platform endpoint is configured (PAGENT_WRITEBACK_URL)',
+          'the payload and its idempotency key are valid; set the endpoint to commit');
+      },
+    };
+  }
+  void context;
+  return {
+    name: platform,
+    validate: (payload: WritebackPlan) => payload.cells.length === 0
+      ? [{ code: 'total-mismatch', detail: 'an empty payload is not a plan' }]
+      : [],
+    commit: async (payload: WritebackPlan) => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': payload.idempotencyKey },
+        body: JSON.stringify(payload),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new HttpError(502, 'platform-rejected', `the platform answered ${response.status}: ${text.slice(0, 300)}`);
+      const parsed = JSON.parse(text || '{}') as { receiptId?: string; acceptedAt?: string };
+      return { receiptId: parsed.receiptId ?? payload.idempotencyKey, acceptedAt: parsed.acceptedAt ?? context.options.now() };
+    },
+  };
 }
 
 async function askHandler(request: Request, context: Context): Promise<unknown> {

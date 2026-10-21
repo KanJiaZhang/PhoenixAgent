@@ -23,6 +23,9 @@ walk 出来。所以
 | 归因 / 投放 | `POST /v1/attribute` · `POST /v1/campaign/optimize` |
 | 风控 | `GET /v1/risk/{report,approvals}` · `POST /v1/risk/approve` |
 | 审计 | `GET /v1/audit/recent`（owner） |
+| **P1 发布** | `POST /v1/semantic/{version,shadow}` · `GET|POST /v1/semantic/lexicon` |
+| **P1 决策** | `POST /v1/risk/{conflicts,capacity}` · `POST /v1/campaign/writeback` |
+| **P1 图与问数** | `POST /v1/graph/features` · `POST /v1/ask/hybrid` |
 
 `POST /v1/ask` 是需求的第 2 条（按查询结构路由）在产品层的落点：一次提问 → 路由签名 → 选子 agent →
 返回该 agent 的结构化答案；若路由分差不足，返回 `mode: "clarify"` 而不是硬选。
@@ -68,6 +71,7 @@ walk 出来。所以
 | SQL 工作台 | 分析/改写、逐步应用与撤销、账本回放、Plan 证据 | `/v1/sql/{plan,steps}` |
 | Skill 库 | 列表与分数、按 SQL 检索、晋级、导出 SKILL.md | `/v1/skills/*` |
 | 业务 Agent | 一句话提问、归因、投放分配、风控报告 | `/v1/{ask,attribute,campaign,risk}` |
+| 发布与决策 | 版本 diff + 漂移 + shadow + 发布门；规则冲突；审核容量；图特征；混合问数与跟进；下发干跑/提交 | `/v1/semantic/{version,shadow,lexicon}`、`/v1/risk/{conflicts,capacity}`、`/v1/graph/features`、`/v1/ask/hybrid`、`/v1/campaign/writeback` |
 
 页面刻意薄：每个按钮一一对应一个端点，所以**验收可以直接打 HTTP**，不需要浏览器——`verify:m8` 就是这么做的。
 浏览器级（Playwright）没有跑，这一点写在限制里。
@@ -81,7 +85,8 @@ walk 出来。所以
 
 ## 8. 验收（`npm run verify:m8`，69 条断言）
 
-- 目录 21 条路由，8 条只读路由逐条 200；未知路由 404（带 `/v1/tools` 提示）；错误方法 405（提示正确方法）。
+- 目录 33 条路由（M8 时 24 条，P1 增加 9 条），只读路由逐条 200；未知路由 404（带 `/v1/tools` 提示）；错误方法 405（提示正确方法）。
+- P1 的 9 条路由由单独的 `verify:p1api`（105 条）验收：角色、确认令牌、审计、Console 调用与库层同一实现。
 - 角色矩阵 7 条断言全过（含"谁要求了什么"的消息内容）。
 - 确认门：令牌验证/换计划/换端点/过期/篡改 5 种情形，各自的错误码；`mode=confirm` 的响应里**没有答案**；
   令牌重放执行成功；换计划被 `plan-mismatch` 拒。

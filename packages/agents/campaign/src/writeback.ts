@@ -140,7 +140,10 @@ export function checkPayload(input: {
   maxChangePct: number;
 }): WritebackPlan['checks'] {
   const proposedSpend = round2(input.cells.reduce((total, cell) => total + cell.proposedSpend, 0));
-  const budgetOk = input.budgetIsCap ? proposedSpend <= round2(input.budget) + 0.01 : Math.abs(proposedSpend - input.budget) <= 0.01;
+  // Rounding each cell to cents accumulates: 36 cells can drift up to 18 fen from the budget. The tolerance is the
+  // worst case of that rounding, not one cent, or a perfectly correct plan reads as "budget not conserved".
+  const rounding = 0.005 * input.cells.length + 0.01;
+  const budgetOk = input.budgetIsCap ? proposedSpend <= round2(input.budget) + rounding : Math.abs(proposedSpend - input.budget) <= rounding;
   const worst = input.cells.reduce((max, cell) => {
     const change = cell.currentSpend === 0 ? (cell.proposedSpend > 0 ? Number.POSITIVE_INFINITY : 0) : Math.abs(cell.proposedSpend / cell.currentSpend - 1);
     return Math.max(max, change);
@@ -153,7 +156,7 @@ export function checkPayload(input: {
       ok: budgetOk,
       detail: `${proposedSpend} vs ${input.budgetIsCap ? `cap ${round2(input.budget)}` : `budget ${round2(input.budget)}`}`,
     },
-    { name: 'per-cell move within bounds', ok: worst <= input.maxChangePct + 1e-9, detail: `worst ${round(worst, 4)} vs limit ${input.maxChangePct}` },
+    { name: 'per-cell move within bounds', ok: worst <= input.maxChangePct + BOUND_EPSILON, detail: `worst ${round(worst, 4)} vs limit ${input.maxChangePct}` },
     { name: 'no negative spend', ok: negative.length === 0, detail: negative.map((cell) => cell.cell).join(', ') || 'none' },
     { name: 'no duplicate cells', ok: !duplicate, detail: duplicate ? 'the same cell appears twice' : 'none' },
   ];
@@ -170,10 +173,11 @@ export function validateWriteback(payload: WritebackPlan, allocation: Allocation
   const budget = options.budget ?? allocation.budget;
   const total = round2(payload.cells.reduce((sum, cell) => sum + cell.proposedSpend, 0));
   const expected = options.budgetIsCap === true ? null : round2(budget);
-  if (expected !== null && Math.abs(total - expected) > 0.01) {
-    issues.push({ code: 'total-mismatch', detail: `payload totals ${total}, budget is ${expected}` });
+  const rounding = 0.005 * payload.cells.length + 0.01;
+  if (expected !== null && Math.abs(total - expected) > rounding) {
+    issues.push({ code: 'total-mismatch', detail: `payload totals ${total}, budget is ${expected} (tolerance ${rounding.toFixed(2)})` });
   }
-  if (options.budgetIsCap === true && total > budget + 0.01) {
+  if (options.budgetIsCap === true && total > budget + rounding) {
     issues.push({ code: 'over-cap', detail: `payload totals ${total}, cap is ${round2(budget)}` });
   }
   const byId = new Map(allocation.cells.map((cell) => [cell.id, cell]));
@@ -190,7 +194,7 @@ export function validateWriteback(payload: WritebackPlan, allocation: Allocation
       issues.push({ code: 'total-mismatch', detail: `payload says ${cell.proposedSpend}, plan says ${round2(source.proposedSpend)}`, cell: cell.cell });
     }
     const limit = options.maxChangePct ?? 0.5;
-    if (source.currentSpend > 0 && Math.abs(cell.proposedSpend / source.currentSpend - 1) > limit + 1e-9) {
+    if (source.currentSpend > 0 && Math.abs(cell.proposedSpend / source.currentSpend - 1) > limit + BOUND_EPSILON) {
       issues.push({ code: 'bound-violated', detail: `move ${round(cell.proposedSpend / source.currentSpend - 1, 4)} exceeds ${limit}`, cell: cell.cell });
     }
     if (cell.proposedSpend < 0) issues.push({ code: 'negative-spend', detail: 'negative spend', cell: cell.cell });
@@ -250,6 +254,9 @@ export function dryRunAdapter(name = 'dry-run'): PlatformAdapter {
     commit: async () => { throw new Error('the dry-run adapter does not commit'); },
   };
 }
+
+/** Cents-level slack: a cell pinned exactly at the bound must not read as "exceeded" because of float noise. */
+const BOUND_EPSILON = 1e-6;
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;

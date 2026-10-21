@@ -38,6 +38,7 @@
     <button data-tab="sql">SQL 工作台</button>
     <button data-tab="skills">Skill 库</button>
     <button data-tab="agents">业务 Agent</button>
+    <button data-tab="release">发布与决策</button>
   </nav>
   <input id="key" placeholder="X-API-Key（owner/analyst/viewer）">
 </header>
@@ -89,6 +90,37 @@
       <button data-act="risk">风控报告</button>
     </div>
     <div id="agents-out"></div>
+  </section>
+  <section id="release">
+    <div class="row">
+      <input id="release-question" value="2025 年 11 月各大区花费" style="flex:1">
+      <button class="primary" data-act="release-version">检查发布</button>
+      <button data-act="release-shadow">只看 shadow</button>
+    </div>
+    <div id="release-out" class="muted">diff 分级 → 仓库漂移 → 同一问题并排跑两个版本 → 发布门。</div>
+
+    <div class="row">
+      <button data-act="release-conflicts">规则冲突</button>
+      <input id="cap-hits" value="200" size="6" title="每天命中数">
+      <input id="cap-minutes" value="12" size="5" title="每单分钟">
+      <input id="cap-people" value="6" size="4" title="审核人数">
+      <button data-act="release-capacity">审核容量</button>
+      <button data-act="release-graph">图特征</button>
+    </div>
+
+    <div class="row">
+      <input id="hybrid-question" placeholder="混合问数：毛利怎么样（学过的词生效）" style="flex:1">
+      <button data-act="hybrid-ask">问</button>
+      <input id="hybrid-follow" placeholder="跟进：那按月呢 / 换成收入" style="flex:1">
+      <button data-act="hybrid-follow">跟进</button>
+    </div>
+
+    <div class="row">
+      <input id="wb-budget" value="3000000" size="10" title="预算">
+      <button class="primary" data-act="wb-dry">下发（干跑）</button>
+      <button class="danger" data-act="wb-commit">确认并提交（owner）</button>
+    </div>
+    <pre id="release-out2" class="muted">写回默认干跑；提交需要 owner 角色 + 确认令牌 + 已配置的平台端点。</pre>
   </section>
 </main>
 <script src="/console.js"></script>

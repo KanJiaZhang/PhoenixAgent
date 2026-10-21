@@ -571,7 +571,7 @@ PhoenixAgent/
 | **P2 / M3** 共享查询层 | ✅ 完成 | `packages/sqllayer`：规则 P01/P02/P03/P04/P06/P13、结果等价改写（P01 列裁剪、P03 日期前缀→半开区间）、EXPLAIN QUERY PLAN + 实测耗时证据、单步账本（apply/revert/人改皆记账、可重放）、suggestion 拒绝应用、CLI。`verify:m3` 29/29 |
 | **P3 / M4** Skill 系统 | ✅ 完成 | `packages/skills`：证据强制（无 evidence 直接拒绝）、作用域硬过滤（方言/表）、两次独立确认才 adopted / 两次 miss 退役、append-only 历史、severity×命中率排序、SKILL.md 往返、CLI。11 条 tip 从真实运行沉淀；8/8 检索命中，去掉一条可量化下降 2；并修掉 publish 依赖 `GET /schema/{graph}` 的真 bug（运行期建图该端点返回 404）。见 `docs/SKILLS-M4.md`；`verify:m4` 29/29 |
 
-| **P1 升级** 图/版本/决策平台/混合问数 | ✅ 完成 | 图特征（5 个结构量）进 holdout 增量：0.9613 → 0.9733；快照取上月最后一天，翻转标签特征不变；基座遍历 40/40。模型 diff 五级分类 + 漂移（7 表/34 列）+ shadow（10% → hold）+ 发布门四组合。规则集重复/子集/冲突/不可达、Erlang-C 容量、双签 quorum、下发幂等键（重排同键、改 1 元变键）。提案校验（6 类）+ 词表学习（目标必须存在、同词不可二指）+ 三轮跟进。见 `docs/P1-UPGRADE.md`；28+33+45+42 = 148 条 |
+| **P1 升级** 图/版本/决策平台/混合问数 | ✅ 完成 | 图特征（5 个结构量）进 holdout 增量：0.9613 → 0.9733；快照取上月最后一天，翻转标签特征不变；基座遍历 40/40。模型 diff 五级分类 + 漂移（7 表/34 列）+ shadow（10% → hold）+ 发布门四组合。规则集重复/子集/冲突/不可达、Erlang-C 容量、双签 quorum、下发幂等键（重排同键、改 1 元变键）。提案校验（6 类）+ 词表学习（目标必须存在、同词不可二指）+ 三轮跟进。见 `docs/P1-UPGRADE.md`；28+33+45+42 = 148 条。接口面：9 条新路由（`/v1/semantic/{version,shadow,lexicon}`、`/v1/risk/{conflicts,capacity}`、`/v1/graph/features`、`/v1/ask/hybrid`、`/v1/campaign/writeback`），Console 第五个工作台，`verify:p1api` 105 条（总计 15 套 668 条） |
 
 ### 与规划不一致的三处（已在 `docs/P1-NOTES.md` 详述）
 
