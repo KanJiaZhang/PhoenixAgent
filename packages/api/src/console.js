@@ -192,6 +192,10 @@ document.querySelectorAll('[data-act]').forEach((button) => {
         base: result.body.models.base.auc, withGraph: result.body.models.withGraph.auc,
         features: result.body.features.map((feature) => ({ name: feature.name, auc: feature.auc })),
         snapshot: result.body.snapshot, labelIndependence: result.body.labelIndependence, limits: result.body.limits,
+        neighbourLabels: {
+          pit: result.body.labelPropagation?.pit, leaky: result.body.labelPropagation?.leaky,
+          addedToModel: result.body.labelPropagation?.models?.increment,
+        },
       });
     }
     if (action === 'hybrid-ask') {

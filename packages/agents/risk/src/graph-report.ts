@@ -18,7 +18,10 @@
 import type { QueryRunner } from '../../../dataplane/src/sqlite.ts';
 import type { GraphClient } from '../../../core/src/graph-client.ts';
 import { evaluateFeature, type FeatureReport, type LabelledValue } from './features.ts';
-import { buildSnapshots, featureValue, featuresAt, GRAPH_FEATURES, publishAndCrossCheck, type CrossCheck, type EntityLink, type GraphSnapshot } from './graph.ts';
+import {
+  buildSnapshots, confirmedLabelsByAccount, featureValue, featuresAt, GRAPH_FEATURES,
+  neighbourLabelStats, publishAndCrossCheck, type CrossCheck, type EntityLink,
+} from './graph.ts';
 import { evaluate, fitLogistic, fitStandardizer, type Sample } from './model.ts';
 
 export interface GraphReport {
@@ -35,8 +38,23 @@ export interface GraphReport {
     increment: number;
     coefficients: { name: string; weight: number }[];
   };
-  /** Recomputing the features with flipped labels must not change a single value: no label reads 1. */
+  /** Recomputing the structural features with flipped labels must not change a single value: no label reads 1. */
   labelIndependence: { identical: boolean; checked: number };
+  /**
+   * Neighbour reputation, built only from labels *confirmed* before the cutoff - and the leaky version as a control.
+   * The leaky AUC being higher is the point: it is the measurement that says the gate is doing something.
+   */
+  labelPropagation: {
+    feature: string;
+    pit: { auc: number; coverage: number; positives: number };
+    leaky: { auc: number; coverage: number };
+    /** base + structural vs base + structural + the PIT label feature. */
+    models: { withoutLabels: number; withLabels: number; increment: number };
+    /** Recomputed from a truncated label table: identical proves no post-cutoff label was read. */
+    cutoffRespected: { identical: boolean; checked: number; leakyDiffers: boolean };
+    /** Per-month AUC of the two variants: the leak's advantage shows up where the graph is young. */
+    monthly: { month: string; positives: number; pit: number; leaky: number }[];
+  };
   crossCheck: CrossCheck | null;
   limits: string[];
   cost: { ms: number; accounts: number; events: number; queries: number };
@@ -71,11 +89,12 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   };
 
   const events = runQuery(
-    `SELECT event_id, event_date, amount, account_id, device_id, ip_id, is_fraud
+    `SELECT event_id, event_date, label_date, amount, account_id, device_id, ip_id, is_fraud
      FROM risk_event ORDER BY event_date, event_id`,
   ).rows.map((row) => ({
     id: String(row.event_id),
     date: String(row.event_date),
+    labelDate: String(row.label_date),
     month: String(row.event_date).slice(0, 7),
     amount: Number(row.amount),
     account: String(row.account_id),
@@ -83,6 +102,9 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
     ip: String(row.ip_id),
     label: (Number(row.is_fraud) === 1 ? 1 : 0) as 0 | 1,
   }));
+
+  // when each label became knowable - the input to every "confirmed" set below
+  const labelDateOf = new Map(events.map((event) => [event.id, event.labelDate]));
 
   const links: EntityLink[] = events.map((event) => ({
     eventId: event.id, date: event.date, account: event.account, device: event.device, ip: event.ip,
@@ -121,6 +143,49 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
     const ringSize = Math.max(0, ...[...snapshot.features.values()].map((entry) => entry.componentSize));
     return { month, asOf: snapshot.asOf, accounts: snapshot.accounts, ringComponentSize: ringSize, auc: report.auc, positives: values.filter((entry) => entry.label === 1).length };
   });
+
+  // --- label propagation, with the cutoff enforced on the labels themselves
+  const labelRows = events.map((event) => ({
+    account: event.account,
+    label: event.label,
+    // the day the label became knowable: label_date, not event_date (the demo fixture stores it 7-27 days later)
+    labelDate: labelDateOf.get(event.id) ?? event.date,
+  }));
+  const pitLabelValues: LabelledValue[] = [];
+  const leakyLabelValues: LabelledValue[] = [];
+  const allLabels = confirmedLabelsByAccount(labelRows, '9999-12-31');
+  for (const row of featureRows) {
+    if (!row.features) continue;
+    const snapshot = snapshots.get(row.event.month)!;
+    const pitStats = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
+    const leakyStats = neighbourLabelStats(snapshot, row.event.account, allLabels);
+    pitLabelValues.push({ value: pitStats.rate, label: row.event.label, asOfBeforeEvent: snapshot.asOf <= row.event.date, window: row.event.month });
+    leakyLabelValues.push({ value: leakyStats.rate, label: row.event.label, asOfBeforeEvent: true, window: row.event.month });
+  }
+  const pitLabelReport = evaluateFeature('g_neighbour_fraud_rate', pitLabelValues, { minPositives });
+  const leakyLabelReport = evaluateFeature('g_neighbour_fraud_rate', leakyLabelValues, { minPositives });
+  const labelMonthly = months.map((month) => {
+    const pit = pitLabelValues.filter((value) => value.window === month);
+    const leaky = leakyLabelValues.filter((value) => value.window === month);
+    const positives = pit.filter((value) => value.label === 1).length;
+    return {
+      month,
+      positives,
+      pit: positives >= 5 ? evaluateFeature('pit', pit, { minPositives: 3 }).auc : Number.NaN,
+      leaky: positives >= 5 ? evaluateFeature('leaky', leaky, { minPositives: 3 }).auc : Number.NaN,
+    };
+  });
+
+  // the mechanical leak check: truncating the label table at the event date must change nothing
+  let labelCheckIdentical = true;
+  let labelCheckCount = 0;
+  for (const row of featureRows.filter((entry) => entry.features).slice(0, 500)) {
+    const snapshot = snapshots.get(row.event.month)!;
+    const before = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
+    const after = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
+    labelCheckCount++;
+    if (before.frauds !== after.frauds || before.rate !== after.rate) { labelCheckIdentical = false; break; }
+  }
 
   // --- the comparison: identical rows, identical solver, one extra block
   const snapshotRows = runQuery(
@@ -176,6 +241,23 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   const baseScore = score(baseFit, test, false);
   const graphScore = score(graphFit, test, true);
 
+  // base + structural + the PIT label feature: does neighbour reputation add anything on top of structure?
+  const pitByEvent = new Map<string, number>();
+  for (const [index, row] of featureRows.entries()) {
+    if (!row.features) continue;
+    const snapshot = snapshots.get(row.event.month)!;
+    pitByEvent.set(row.event.id, neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf)).rate);
+  }
+  const rowsWithLabels = (rows: typeof train) => rows.map((row) => ({
+    x: [...rowVector(row), ...graphVector(row), pitByEvent.get(row.event.id) ?? 0],
+    y: row.event.label as 0 | 1,
+  }));
+  const rawWithLabels = rowsWithLabels(train);
+  const labelStandardizer = fitStandardizer(rawWithLabels);
+  const labelModel = fitLogistic(rawWithLabels.map((row) => ({ x: labelStandardizer.transform(row.x), y: row.y })),
+    [...baseNames, ...graphNames, 'g_neighbour_fraud_rate'], { l2: 1 });
+  const labelScore = evaluate(labelModel, rowsWithLabels(test).map((row) => ({ x: labelStandardizer.transform(row.x), y: row.y })));
+
   // --- label independence: a feature builder that reads labels would fail this
   const flipped = featureRows.map((row) => ({ ...row, event: { ...row.event, label: (1 - row.event.label) as 0 | 1 } }));
   let identical = true;
@@ -230,6 +312,18 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
         .filter((entry) => entry.name.startsWith('g_')),
     },
     labelIndependence: { identical, checked },
+    labelPropagation: {
+      feature: 'g_neighbour_fraud_rate',
+      pit: { auc: pitLabelReport.auc, coverage: pitLabelReport.coverage, positives: pitLabelReport.positives },
+      leaky: { auc: leakyLabelReport.auc, coverage: leakyLabelReport.coverage },
+      models: {
+        withoutLabels: round(graphScore.auc, 4),
+        withLabels: round(labelScore.auc, 4),
+        increment: round(labelScore.auc - graphScore.auc, 4),
+      },
+      cutoffRespected: { identical: labelCheckIdentical, checked: labelCheckCount, leakyDiffers: leakyLabelReport.auc !== pitLabelReport.auc },
+      monthly: labelMonthly,
+    },
     crossCheck,
     limits: [
       '图特征只有结构量（连通分量、两跳账户、设备扇出、PageRank），不读标签；任何"邻居欺诈率"都是标签穿了件图的外衣',

@@ -59,6 +59,8 @@ export interface GraphSnapshot {
   ips: number;
   edges: number;
   features: Map<string, GraphAccountFeatures>;
+  /** account -> accounts sharing a device or an IP (the same two-hop definition as `twoHopAccounts`). */
+  neighbours: Map<string, Set<string>>;
   /** The subset of links the snapshot actually used; the publisher writes exactly these. */
   links: EntityLink[];
 }
@@ -121,6 +123,7 @@ export function buildSnapshot(links: EntityLink[], asOf: string, serves: string)
   const pagerank = pagerankOf(accountDevices, deviceAccounts, accountIps, ipAccounts);
 
   const features = new Map<string, GraphAccountFeatures>();
+  const neighboursOf = new Map<string, Set<string>>();
   for (const [account, devices] of accountDevices) {
     const neighbours = new Set<string>();
     let sharedDeviceMax = 1;
@@ -132,6 +135,7 @@ export function buildSnapshot(links: EntityLink[], asOf: string, serves: string)
     for (const ip of accountIps.get(account) ?? []) {
       for (const peer of ipAccounts.get(ip)!) if (peer !== account) neighbours.add(peer);
     }
+    neighboursOf.set(account, neighbours);
     features.set(account, {
       account,
       componentSize: componentAccounts.get(find(account)) ?? 1,
@@ -150,6 +154,7 @@ export function buildSnapshot(links: EntityLink[], asOf: string, serves: string)
     ips: ipAccounts.size,
     edges: used.length,
     features,
+    neighbours: neighboursOf,
     links: used,
   };
 }
@@ -205,6 +210,51 @@ function pagerankOf(
   const out = new Map<string, number>();
   for (const account of accounts) out.set(account, rank.get(account) ?? 0);
   return out;
+}
+
+export interface ConfirmedLabels {
+  /** account -> the date its first fraud was *confirmed* (label_date, not event_date). */
+  firstFraud: Map<string, string>;
+}
+
+/**
+ * Neighbour reputation, from labels that exist at the cutoff and not one day later.
+ *
+ * This is the feature everybody reaches for first, and the one that is easiest to make useless: a neighbour's label is
+ * only known on `label_date`, which is days or weeks *after* the neighbour's event. A feature that counts "fraudulent
+ * neighbours" from the final label table is a future function wearing a graph costume - it scores beautifully and
+ * cannot be computed at decision time.
+ *
+ * So the input here is not the label table, it is "labels confirmed on or before asOf", and the caller is expected to
+ * build that set from `label_date`. `verify:p1graph` checks the difference by computing the same feature from all
+ * labels and showing that the leaky version is the better one - which is exactly why it is not the one we use.
+ */
+export function confirmedLabelsByAccount(labels: { account: string; labelDate: string; label: 0 | 1 }[], asOf: string): ConfirmedLabels {
+  const firstFraud = new Map<string, string>();
+  for (const entry of labels) {
+    if (entry.label !== 1) continue;
+    if (entry.labelDate > asOf) continue;
+    const existing = firstFraud.get(entry.account);
+    if (!existing || entry.labelDate < existing) firstFraud.set(entry.account, entry.labelDate);
+  }
+  return { firstFraud };
+}
+
+export interface NeighbourLabels {
+  /** Share of this account's neighbours whose fraud was confirmed by the cutoff (0 when it has none). */
+  rate: number;
+  /** Neighbours with a confirmed fraud, and neighbours in total. */
+  frauds: number;
+  neighbours: number;
+}
+
+/** The feature for one account against one snapshot and one label set. O(degree), not O(graph). */
+export function neighbourLabelStats(snapshot: GraphSnapshot, account: string, confirmed: ConfirmedLabels): NeighbourLabels {
+  const neighbours = snapshot.neighbours.get(account);
+  if (!neighbours || neighbours.size === 0) return { rate: 0, frauds: 0, neighbours: 0 };
+  let frauds = 0;
+  for (const other of neighbours) if (confirmed.firstFraud.has(other)) frauds++;
+  return { rate: frauds / neighbours.size, frauds, neighbours: neighbours.size };
 }
 
 /** The feature block for one event, from the snapshot of its own month (as of the previous month end). */

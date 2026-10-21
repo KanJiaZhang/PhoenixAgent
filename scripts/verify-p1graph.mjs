@@ -126,6 +126,20 @@ check('the leaky variant is often *not* better, so quality cannot be the check',
 check('the report refuses to use the leaky values at all', report.features.every((feature) => feature.pointInTime.ok),
   'graph-report.ts builds every snapshot from snapshotCutoff(), never from the event month');
 
+section('neighbour reputation: the feature everyone reaches for, measured and not shipped');
+const labels = report.labelPropagation;
+check('a label-confirmed neighbour feature is computed', labels.pit.auc > 0.6, `AUC ${labels.pit.auc}`);
+check('it never reads a label confirmed after the cutoff',
+  labels.cutoffRespected.identical && labels.cutoffRespected.checked >= 400,
+  `${labels.cutoffRespected.checked} recomputations, identical ${labels.cutoffRespected.identical}`);
+const early = labels.monthly.filter((entry) => Number.isFinite(entry.pit) && Number.isFinite(entry.leaky)).slice(0, 5);
+const earlyPit = early.reduce((total, entry) => total + entry.pit, 0) / Math.max(early.length, 1);
+const earlyLeaky = early.reduce((total, entry) => total + entry.leaky, 0) / Math.max(early.length, 1);
+check('the leaky variant is only marginally better, even where the graph is young', earlyLeaky - earlyPit < 0.05,
+  `early months: PIT ${earlyPit.toFixed(3)} vs leaky ${earlyLeaky.toFixed(3)}`);
+check('and the feature adds nothing on top of structure, so it is not in the model', labels.models.increment <= 0.001,
+  `${labels.models.withoutLabels} -> ${labels.models.withLabels} (+${labels.models.increment})`);
+
 section('held-out increment: same rows, same solver, one extra block');
 check('the split is the last six months', report.models.split.test.events >= 3000, `${report.models.split.test.events} test events`);
 check('base model is not a straw man', report.models.base.auc >= 0.7, `base AUC ${report.models.base.auc}`);
