@@ -37,9 +37,9 @@ import { campaign } from '../../agents/campaign/src/index.ts';
 import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
 import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
 import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
-import { buildTimeline, TimelineLog } from '../../semantic/src/timeline.ts';
+import { buildTimeline, buildTrace, TimelineLog } from '../../semantic/src/timeline.ts';
 import { ask, askHybrid, AskSession, DraftQueue, interpret, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
-import { addAlias, buildValueVocabulary, loadAliases, loadSuppressions, loadVocabulary, saveVocabulary, suppressValue, valuesPath } from '../../semantic/src/ask/index.ts';
+import { addAlias, buildValueVocabulary, loadAliases, loadSuppressions, loadVocabulary, refreshVocabulary, saveVocabulary, suppressValue, valuesPath } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
 import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
 import { createGateway } from '../../core/src/llm.ts';
@@ -496,7 +496,7 @@ function buildRoutes(): RouteDef[] {
             }
           }
           try {
-            const scope = request.body.scope as { groups?: unknown; dimension?: unknown; values?: unknown } | undefined;
+            const scope = request.body.scope as { groups?: unknown; dimension?: unknown; values?: unknown; actors?: unknown } | undefined;
             const guard = request.body.qualityGuard as { maxRelativeDelta?: unknown } | undefined;
             return store.start({
               from, to, canaryPct: Number(request.body.canaryPct ?? 10),
@@ -505,10 +505,11 @@ function buildRoutes(): RouteDef[] {
                 : {}),
               actor: request.principal.actor, now,
               ...(typeof request.body.question === 'string' ? { probeQuestion: request.body.question } : {}),
-              ...(scope && (Array.isArray(scope.groups) || typeof scope.dimension === 'string')
+              ...(scope && (Array.isArray(scope.groups) || Array.isArray(scope.actors) || typeof scope.dimension === 'string')
                 ? {
                   scope: {
                     ...(Array.isArray(scope.groups) ? { groups: scope.groups.map(String) } : {}),
+                    ...(Array.isArray(scope.actors) ? { actors: scope.actors.map(String) } : {}),
                     ...(typeof scope.dimension === 'string'
                       ? { dimension: scope.dimension, values: Array.isArray(scope.values) ? scope.values.map(String) : [] }
                       : {}),
@@ -1020,6 +1021,17 @@ function buildRoutes(): RouteDef[] {
       },
     },
     {
+      method: 'GET', path: '/v1/trace', role: 'owner',
+      summary: 'decisions and traffic in one ordered list: what was decided and who called what',
+      input: ['graph', 'limit'],
+      handler: (request, context) => buildTrace({
+        workspace: context.options.workspace,
+        graph: String(request.query.get('graph') ?? context.options.graph),
+        auditPath: context.auditPath,
+        limit: Number(request.query.get('limit') ?? 400),
+      }),
+    },
+    {
       method: 'GET', path: '/v1/semantic/values', role: 'viewer',
       summary: 'the value vocabulary: which words are a slice of which dimension, and where they were read from',
       input: ['graph'],
@@ -1048,6 +1060,20 @@ function buildRoutes(): RouteDef[] {
           }));
           saveVocabulary(context.options.workspace, vocabulary);
           return vocabulary;
+        }
+        if (action === 'refresh') {
+          const { index } = loadModel(context, graph);
+          const refreshed = withDatabase(context, (run) => refreshVocabulary({
+            index, run, graph, workspace: context.options.workspace, actor: request.principal.actor, now: context.options.now(),
+          }));
+          saveVocabulary(context.options.workspace, refreshed.vocabulary);
+          if (refreshed.changed) {
+            new TimelineLog(context.options.workspace, graph).append({
+              at: context.options.now(), kind: 'lexicon', actor: request.principal.actor,
+              detail: `vocabulary: +${refreshed.diff.added.length} -${refreshed.diff.removed.length} values`,
+            });
+          }
+          return refreshed;
         }
         if (action === 'alias') {
           const vocabulary = loadVocabulary(context.options.workspace, graph);
@@ -1082,7 +1108,7 @@ function buildRoutes(): RouteDef[] {
             throw new HttpError(409, 'suppression-refused', (error as Error).message);
           }
         }
-        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use build, alias or suppress');
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use build, refresh, alias or suppress');
       },
     },
     {

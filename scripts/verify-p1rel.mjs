@@ -264,6 +264,21 @@ try {
     String(noSlice.body.plan.modelRevision));
   await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'vocabulary slice test done' }, 'owner');
 
+  section('7d. a beta list is an audience somebody wrote down');
+  const beta = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 2, canaryPct: 100, scope: { actors: ['carol'] },
+    retry: { reason: 'beta list test' },
+  }, 'owner');
+  checkEqual('the list is stored with the release', beta.status, 200);
+  checkEqual('and names the beta users', JSON.stringify(beta.body.scope?.actors), '["carol"]');
+  const betaUser = await http('POST', '/v1/semantic/ask', { question }, 'viewer');
+  checkEqual('a beta user is on the canary even at 100%', betaUser.body.plan.modelRevision, 2);
+  const nonBeta = await http('POST', '/v1/semantic/ask', { question }, 'canary-key');
+  check('anyone else is not',
+    nonBeta.body.plan.modelRevision === null || nonBeta.body.plan.modelRevision === 1,
+    String(nonBeta.body.plan.modelRevision));
+  await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'beta list test done' }, 'owner');
+
   section('8. a canary whose number moves is a failure, not just a slow release');
   const guarded = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, qualityGuard: { maxRelativeDelta: 0.02 },

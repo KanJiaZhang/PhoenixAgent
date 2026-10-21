@@ -47,6 +47,8 @@ export interface BuildValuesOptions {
   index: ModelIndex;
   run: QueryRunner;
   graph: string;
+  /** Where the vocabulary artifact lives; required by `refreshVocabulary`. */
+  workspace?: string;
   maxValues?: number;
   /** Only these dimensions, when a caller wants a subset. */
   dimensionIds?: string[];
@@ -115,6 +117,66 @@ export function buildValueVocabulary(options: BuildValuesOptions): ValueVocabula
     dimensions,
     skipped,
   };
+}
+
+export interface ValueDiff {
+  added: { dimension: string; value: string }[];
+  removed: { dimension: string; value: string }[];
+  addedDimensions: string[];
+  removedDimensions: string[];
+  unchanged: number;
+}
+
+/**
+ * What changed between the vocabulary in use and a fresh read of the warehouse.
+ *
+ * Values are facts, so a refresh adopts them; what changes is that the change is *visible* - an added region, a
+ * channel that disappeared, a dimension that stopped being enumerable. Without this, a value silently stops being
+ * answerable (or starts being) and nobody can tell when.
+ */
+export function diffVocabulary(previous: ValueVocabulary | null, next: ValueVocabulary): ValueDiff {
+  const before = new Map((previous?.dimensions ?? []).map((entry) => [entry.dimension, new Set(entry.values)]));
+  const after = new Map(next.dimensions.map((entry) => [entry.dimension, new Set(entry.values)]));
+  const added: ValueDiff["added"] = [];
+  const removed: ValueDiff["removed"] = [];
+  let unchanged = 0;
+  for (const [dimension, values] of after) {
+    const old = before.get(dimension) ?? new Set<string>();
+    for (const value of values) {
+      if (old.has(value)) unchanged++;
+      else added.push({ dimension, value });
+    }
+    for (const value of old) if (!values.has(value)) removed.push({ dimension, value });
+  }
+  return {
+    added,
+    removed,
+    addedDimensions: [...after.keys()].filter((dimension) => !before.has(dimension)),
+    removedDimensions: [...before.keys()].filter((dimension) => !after.has(dimension)),
+    unchanged,
+  };
+}
+
+export interface RefreshResult {
+  vocabulary: ValueVocabulary;
+  diff: ValueDiff;
+  /** True when anything moved: a caller can decide whether that deserves a release note. */
+  changed: boolean;
+}
+
+/**
+ * Re-reads the warehouse and records what moved.
+ *
+ * The refresh is a decision like any other, so it goes on the timeline: "the vocabulary changed on this date, by this
+ * much" is the question an auditor asks when a report suddenly shows a new region.
+ */
+export function refreshVocabulary(options: BuildValuesOptions & { actor: string; workspace: string }): RefreshResult {
+  const previous = loadVocabulary(options.workspace, options.graph);
+  const next = buildValueVocabulary(options);
+  const diff = diffVocabulary(previous, next);
+  const changed = diff.added.length > 0 || diff.removed.length > 0
+    || diff.addedDimensions.length > 0 || diff.removedDimensions.length > 0;
+  return { vocabulary: next, diff, changed };
 }
 
 /**

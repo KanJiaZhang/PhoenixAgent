@@ -73,7 +73,9 @@ const readRoutes = tools.filter((tool) => tool.method === 'GET' && !tool.path.in
 let answered = 0;
 const notAnswered = [];
 for (const route of readRoutes) {
-  const response = await http('GET', route.path, undefined, route.path === '/v1/audit/recent' ? OWNER : VIEWER);
+  // owner-only reads: the audit trail and the merged trace both expose who called what
+  const ownerOnly = route.path === '/v1/audit/recent' || route.path === '/v1/trace';
+  const response = await http('GET', route.path, undefined, ownerOnly ? OWNER : VIEWER);
   if (response.status === 200) answered++;
   else notAnswered.push(`${route.path} -> ${response.status}`);
 }

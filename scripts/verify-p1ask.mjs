@@ -20,7 +20,7 @@ import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { build } from '../packages/semantic/src/pipeline.ts';
 import { ask } from '../packages/semantic/src/ask/query.ts';
 import { indexModel } from '../packages/semantic/src/sql.ts';
-import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion, buildValueVocabulary, loadAliases, addAlias, suppressValue, loadSuppressions } from '../packages/semantic/src/ask/index.ts';
+import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion, buildValueVocabulary, loadAliases, addAlias, suppressValue, loadSuppressions, diffVocabulary } from '../packages/semantic/src/ask/index.ts';
 
 const root = process.cwd();
 const workspace = join(root, '.pag-p1ask');
@@ -325,7 +325,23 @@ try {
 }
 check('a suppression without a reason is refused', noReason !== null, noReason?.message ?? '');
 
-section('13. determinism');
+section('13. the vocabulary ages: a refresh says what moved');
+const older = structuredClone(vocabulary);
+older.dimensions = older.dimensions.map((entry) => entry.dimension === 'dim/region'
+  ? { ...entry, values: entry.values.filter((value) => value !== '华东') }
+  : entry);
+const diff = diffVocabulary(older, vocabulary);
+check('the diff names the value that appeared', diff.added.some((entry) => entry.dimension === 'dim/region' && entry.value === '华东'),
+  JSON.stringify(diff.added));
+check('and counts the ones that did not move', diff.unchanged >= 10, String(diff.unchanged));
+const removedDiff = diffVocabulary(vocabulary, older);
+check('a disappearing value is reported too', removedDiff.removed.some((entry) => entry.value === '华东'),
+  JSON.stringify(removedDiff.removed));
+const noChange = diffVocabulary(vocabulary, structuredClone(vocabulary));
+check('the same vocabulary diffs to nothing', noChange.added.length === 0 && noChange.removed.length === 0, JSON.stringify(noChange));
+
+section('14. determinism');
+
 
 const again = await askHybrid({ question: '2025 年 11 月各大区毛利', index, run, workspace, graph, now });
 check('the same question gives the same SQL', again.plan?.sql[0] === afterLearning.plan?.sql[0], 'identical statements');

@@ -165,6 +165,68 @@ export function buildTimeline(options: { workspace: string; graph: string; audit
   };
 }
 
+export interface TraceEntry {
+  at: string;
+  kind: 'decision' | 'read';
+  actor: string;
+  detail: string;
+  /** HTTP status, for a read. */
+  status?: number;
+}
+
+export interface Trace {
+  entries: TraceEntry[];
+  counts: { decision: number; read: number };
+  /** The decisions on their own, for a caller that wants the story rather than the traffic. */
+  timeline: Timeline;
+  limits: string[];
+}
+
+/**
+ * Decisions and traffic, in one ordered list.
+ *
+ * The timeline answers "what was decided"; the audit trail answers "who called what". They are two records because they
+ * are written at different moments by different code, and merging them here (rather than writing both everywhere) keeps
+ * each honest. The merge is ordered, and a publish appears twice on purpose: once as the request that was made, once as
+ * the decision it produced - that pair is exactly what an investigation wants to see.
+ */
+export function buildTrace(options: { workspace: string; graph: string; auditPath?: string; limit?: number }): Trace {
+  const timeline = buildTimeline(options);
+  const auditPath = options.auditPath ?? join(options.workspace, 'audit', 'api.jsonl');
+  const entries: TraceEntry[] = [];
+  for (const event of timeline.events) {
+    entries.push({ at: event.at, kind: 'decision', actor: event.actor, detail: `${event.kind}: ${event.detail}` });
+  }
+  for (const line of readLegacyJsonl(auditPath)) {
+    entries.push({
+      at: String(line.ts ?? ''),
+      kind: 'read',
+      actor: String(line.actor ?? 'unknown'),
+      detail: `${String(line.method ?? '')} ${String(line.path ?? '')}`,
+      ...(typeof line.status === 'number' ? { status: line.status } : {}),
+    });
+  }
+  entries.sort((left, right) => {
+    if (left.at !== right.at) return left.at.localeCompare(right.at);
+    // a request before its decision, deterministically
+    if (left.kind !== right.kind) return left.kind === 'read' ? -1 : 1;
+    return left.detail.localeCompare(right.detail);
+  });
+  const limited = entries.slice(-Math.max(1, Math.min(options.limit ?? 400, 5000)));
+  return {
+    entries: limited,
+    counts: {
+      decision: limited.filter((entry) => entry.kind === 'decision').length,
+      read: limited.filter((entry) => entry.kind === 'read').length,
+    },
+    timeline,
+    limits: [
+      '读只记接口与状态，不记返回值：这里是可追溯性，不是数据副本',
+      '时间线记决定、审计记流量，两侧都在才算完整；只有一侧时不要把它当全部',
+    ],
+  };
+}
+
 function readLegacyJsonl(path: string): Record<string, unknown>[] {
   return readJsonlTyped<Record<string, unknown>>(path);
 }

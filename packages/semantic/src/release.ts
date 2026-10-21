@@ -37,7 +37,7 @@ export interface ReleaseConfig {
    * the slice - it is everyone, and rolling "everyone" out under the name of 华东 is how a scoped release stops being
    * scoped.
    */
-  scope?: { groups?: string[]; dimension?: string; values?: string[] };
+  scope?: { groups?: string[]; dimension?: string; values?: string[]; actors?: string[] };
   /** When set, a canary answer whose total moves further than this against the stable answer is a failure. */
   qualityGuard?: { maxRelativeDelta: number };
   /** 1 for the first attempt; a retry after a rollback increments it and records why. */
@@ -129,7 +129,7 @@ export class ReleaseStore {
 
   start(options: {
     from: number; to: number; canaryPct: number; actor: string; now?: string; probeQuestion?: string;
-    scope?: { groups?: string[]; dimension?: string; values?: string[] }; qualityGuard?: { maxRelativeDelta: number };
+    scope?: { groups?: string[]; dimension?: string; values?: string[]; actors?: string[] }; qualityGuard?: { maxRelativeDelta: number };
     /** Required after a rollback: what went wrong last time, and what is different now. */
     retry?: { reason: string };
   }): ReleaseConfig {
@@ -158,10 +158,11 @@ export class ReleaseStore {
         ? { retry: { of: existing.rollback?.reason ?? 'no reason', reason: options.retry.reason, at: options.now ?? new Date().toISOString() } }
         : {}),
       ...(options.probeQuestion ? { probeQuestion: options.probeQuestion } : {}),
-      ...(options.scope && (options.scope.groups?.length || options.scope.dimension)
+      ...(options.scope && (options.scope.groups?.length || options.scope.dimension || options.scope.actors?.length)
         ? {
           scope: {
             ...(options.scope.groups?.length ? { groups: options.scope.groups } : {}),
+            ...(options.scope.actors?.length ? { actors: options.scope.actors } : {}),
             ...(options.scope.dimension ? { dimension: options.scope.dimension, values: options.scope.values ?? [] } : {}),
           },
         }
@@ -326,6 +327,10 @@ export function pickRevision(config: ReleaseConfig | null, actor: string, questi
   if (config.status === 'rolled-back') return { revision: 'stable', bucket, side: 'rolled-back' };
   // a scoped release excludes everyone outside it before the bucket is even consulted
   if (config.scope?.groups?.length && !(group && config.scope.groups.includes(group))) {
+    return { revision: 'stable', bucket, side: 'out-of-scope' };
+  }
+  // a beta list is an explicit audience: no user database, just names somebody wrote down
+  if (config.scope?.actors?.length && !config.scope.actors.includes(actor)) {
     return { revision: 'stable', bucket, side: 'out-of-scope' };
   }
   if (config.scope?.dimension) {

@@ -82,7 +82,7 @@ try {
   section('1. the catalogue carries the new routes, with their roles');
   const catalogue = await http('GET', '/v1/tools');
   const tools = catalogue.body.tools;
-  check('the catalogue grew', tools.length >= 41, `${tools.length} routes`);
+  check('the catalogue grew', tools.length >= 42, `${tools.length} routes`);
   const expected = [
     ['POST', '/v1/semantic/version', 'viewer'],
     ['POST', '/v1/semantic/shadow', 'viewer'],
@@ -100,6 +100,7 @@ try {
     ['POST', '/v1/semantic/lexicon/drafts/:id', 'analyst'],
     ['GET', '/v1/semantic/timeline', 'viewer'],
     ['GET', '/v1/semantic/values', 'viewer'],
+    ['GET', '/v1/trace', 'owner'],
     ['POST', '/v1/semantic/values', 'analyst'],
   ];
   for (const [method, path, role] of expected) {
@@ -269,6 +270,10 @@ try {
   checkEqual('an alias is accepted', alias.status, 200);
   const aliasedAsk = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东区花费' });
   check('and the alias answers the same slice', aliasedAsk.body.answer?.rows?.length === 1, JSON.stringify(aliasedAsk.body.answer?.rows));
+  const refreshed = await http('POST', '/v1/semantic/values', { action: 'refresh' }, 'analyst');
+  checkEqual('a refresh answers with a diff', refreshed.status, 200);
+  check('the diff is empty when nothing moved', refreshed.body.diff.added.length === 0 && refreshed.body.changed === false,
+    JSON.stringify(refreshed.body.diff));
   const viewerAlias = await http('POST', '/v1/semantic/values', { action: 'alias', word: '华南区', dimension: 'dim/region', value: '华南' });
   checkEqual('a viewer cannot write an alias', viewerAlias.status, 403);
 
@@ -278,6 +283,21 @@ try {
   check('it is ordered', timeline.body.events.every((event, index, all) => index === 0 || all[index - 1].at <= event.at),
     timeline.body.events.length + ' events');
   check('and it names the lexicon decisions this run made', timeline.body.counts.lexicon >= 1, JSON.stringify(timeline.body.counts));
+
+  section('6c. the trace merges decisions and traffic, and only the owner sees it');
+  const viewerTrace = await http('GET', '/v1/trace');
+  checkEqual('a viewer cannot read the trace', viewerTrace.status, 403);
+  const trace = await http('GET', '/v1/trace?limit=300', undefined, 'owner');
+  checkEqual('the owner can', trace.status, 200);
+  check('it carries both decisions and reads', trace.body.counts.decision > 0 && trace.body.counts.read > 0,
+    JSON.stringify(trace.body.counts));
+  check('the decisions include the learned word', trace.body.entries.some((entry) => entry.kind === 'decision' && /learned/.test(entry.detail)),
+    trace.body.entries.filter((entry) => entry.kind === 'decision').slice(-2).map((entry) => entry.detail).join(' | '));
+  check('the reads include this very request', trace.body.entries.some((entry) => entry.kind === 'read' && entry.detail.includes('/v1/trace')),
+    'trace read is on the trace');
+  check('and the list is ordered', trace.body.entries.every((entry, index, all) => index === 0 || all[index - 1].at <= entry.at),
+    trace.body.entries.length + ' entries');
+  check('the limits say what a read does not record', trace.body.limits.length > 0, trace.body.limits[0].slice(0, 40));
 
   section('7. the audit trail covers the new routes');
   const audit = await http('GET', '/v1/audit/recent?limit=200', undefined, 'owner');
