@@ -37,9 +37,9 @@ import { campaign } from '../../agents/campaign/src/index.ts';
 import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
 import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
 import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
-import { buildTimeline } from '../../semantic/src/timeline.ts';
-import { ask, askHybrid, AskSession, DraftQueue, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
-import { addAlias, buildValueVocabulary, loadAliases, loadVocabulary, saveVocabulary, valuesPath } from '../../semantic/src/ask/index.ts';
+import { buildTimeline, TimelineLog } from '../../semantic/src/timeline.ts';
+import { ask, askHybrid, AskSession, DraftQueue, interpret, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
+import { addAlias, buildValueVocabulary, loadAliases, loadSuppressions, loadVocabulary, saveVocabulary, suppressValue, valuesPath } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
 import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
 import { createGateway } from '../../core/src/llm.ts';
@@ -633,6 +633,10 @@ function buildRoutes(): RouteDef[] {
           target: String(request.body.target ?? ''), reason: String(request.body.reason ?? ''),
           ...(request.body.patch === undefined ? {} : { patch: request.body.patch as Record<string, unknown> }),
         });
+        new TimelineLog(context.options.workspace, graph).append({
+          at: context.options.now(), kind: 'review', actor: request.principal.actor,
+          detail: `${action} ${String(request.body.target ?? '')}${request.body.reason ? ` - ${String(request.body.reason)}` : ''}`,
+        });
         const outcome = rebuildReport({
           fixtures: context.options.fixtures, graph, workspace: context.options.workspace, now: context.options.now(),
         });
@@ -659,6 +663,10 @@ function buildRoutes(): RouteDef[] {
           ...(previous?.candidates ? { previousCandidates: previous.candidates as never } : {}),
         });
         const snapshot = join(context.options.workspace, 'models', graph, `v${revision}.json`);
+        new TimelineLog(context.options.workspace, graph).append({
+          at: context.options.now(), kind: 'publish', actor: request.principal.actor,
+          detail: `${graph} published v${revision}`, revision,
+        });
         return { ...result, snapshot, analyticalExport: exportAnalytical(graph, outcome.reviewed, revision) as unknown as null };
       },
     },
@@ -1020,6 +1028,7 @@ function buildRoutes(): RouteDef[] {
         return {
           vocabulary: loadVocabulary(context.options.workspace, graph),
           aliases: loadAliases(context.options.workspace, graph),
+          suppressions: loadSuppressions(context.options.workspace, graph),
           path: valuesPath(context.options.workspace, graph),
         };
       },
@@ -1056,7 +1065,24 @@ function buildRoutes(): RouteDef[] {
             throw new HttpError(409, 'alias-refused', (error as Error).message);
           }
         }
-        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use build or alias');
+        if (action === 'suppress') {
+          const vocabulary = loadVocabulary(context.options.workspace, graph);
+          if (!vocabulary) {
+            throw new HttpError(409, 'no-vocabulary', `no value vocabulary for '${graph}'`, 'build it first');
+          }
+          try {
+            return suppressValue({
+              workspace: context.options.workspace, graph, vocabulary,
+              ...(typeof request.body.word === 'string' ? { word: request.body.word } : {}),
+              ...(typeof request.body.dimension === 'string' ? { dimension: request.body.dimension } : {}),
+              ...(typeof request.body.value === 'string' ? { value: request.body.value } : {}),
+              reason: String(request.body.reason ?? ''), actor: request.principal.actor, now: context.options.now(),
+            });
+          } catch (error) {
+            throw new HttpError(409, 'suppression-refused', (error as Error).message);
+          }
+        }
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use build, alias or suppress');
       },
     },
     {
@@ -1258,7 +1284,11 @@ function canaryFailure(context: Context, route: { side: string; revision: number
 function valueContext(context: Context, graph: string) {
   const vocabulary = loadVocabulary(context.options.workspace, graph);
   if (!vocabulary) return undefined;
-  return { vocabulary, aliases: loadAliases(context.options.workspace, graph) };
+  return {
+    vocabulary,
+    aliases: loadAliases(context.options.workspace, graph),
+    suppressions: loadSuppressions(context.options.workspace, graph),
+  };
 }
 
 /** The explicit value filters a request carries, which is what a dimension-scoped canary routes on. */
@@ -1269,6 +1299,27 @@ function specFilters(request: Request): { dimension: string; value: string }[] {
     .filter((entry): entry is { dimension: string; value: string } =>
       typeof entry === 'object' && entry !== null && typeof (entry as { dimension?: unknown }).dimension === 'string'
       && typeof (entry as { value?: unknown }).value === 'string');
+}
+
+/**
+ * The filters a scoped canary routes on: the explicit ones, plus the ones the vocabulary derives from the words.
+ *
+ * A question that says 华东 carries no  in its spec - the filter appears when the interpreter runs, which is
+ * after the revision has been chosen. So for a dimension-scoped release the question is interpreted once against the
+ * stable model (cheap, no SQL) purely to learn which slice it is about. Without a vocabulary there is nothing to
+ * derive, and the release stays scoped to explicit filters only - that is the honest limit, not a silent default.
+ */
+function filtersForRouting(context: Context, graph: string, request: Request, question: string): { dimension: string; value: string }[] {
+  const explicit = specFilters(request);
+  if (explicit.length > 0 || question.trim().length === 0) return explicit;
+  const values = valueContext(context, graph);
+  if (!values) return explicit;
+  try {
+    const interpreted = interpret(question, loadModel(context, graph).index, new Date(context.options.now()), values);
+    return interpreted.spec?.filters ?? [];
+  } catch {
+    return explicit;
+  }
 }
 
 /** The number a quality guard compares: the answer's total, from either the semantic or the hybrid result shape. */
@@ -1283,7 +1334,7 @@ function totalOf(result: unknown): number | null {
 /** Runs `fn` against the canary index when the bucket says so, and records the outcome either way. */
 function withCanary<T>(request: Request, context: Context, graph: string, question: string,
   fn: (chosen: { index: ModelIndex; revision: number | null }) => T): T {
-  const route = canaryRoute(context, graph, request.principal.actor, question, request.group, specFilters(request));
+  const route = canaryRoute(context, graph, request.principal.actor, question, request.group, filtersForRouting(context, graph, request, question));
   try {
     const result = fn({ index: route.index, revision: route.revision });
     const guarded = route.side === 'canary' || (route.side === 'promoted' && route.watching === true);

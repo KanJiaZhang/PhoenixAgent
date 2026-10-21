@@ -20,7 +20,7 @@ import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { build } from '../packages/semantic/src/pipeline.ts';
 import { ask } from '../packages/semantic/src/ask/query.ts';
 import { indexModel } from '../packages/semantic/src/sql.ts';
-import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion, buildValueVocabulary, loadAliases, addAlias } from '../packages/semantic/src/ask/index.ts';
+import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion, buildValueVocabulary, loadAliases, addAlias, suppressValue, loadSuppressions } from '../packages/semantic/src/ask/index.ts';
 
 const root = process.cwd();
 const workspace = join(root, '.pag-p1ask');
@@ -296,7 +296,37 @@ try {
 }
 check('an alias onto a value that does not exist is refused', badAlias !== null, badAlias?.message ?? '');
 
-section('12. determinism');
+section('12. suppression: a value the business may not ask about');
+const suppression = suppressValue({
+  workspace, graph, vocabulary, value: '华东', dimension: 'dim/region',
+  reason: '内部代号，不允许出现在对外报表', actor: 'alice', now: now.toISOString(),
+});
+checkEqual('the suppression is recorded against the value', suppression.value, '华东');
+const suppressedAsk = await askHybrid({ question: '2025 年 11 月华东大区花费', index, run, workspace, graph, now,
+  values: { vocabulary, aliases: [], suppressions: loadSuppressions(workspace, graph) } });
+checkEqual('asking about it is refused as out of scope', suppressedAsk.refusals[0]?.code, 'out-of-scope');
+check('and the reason is carried', /内部代号/.test(suppressedAsk.refusals[0]?.message ?? ''), suppressedAsk.refusals[0]?.message ?? '');
+const otherSlice = await askHybrid({ question: '2025 年 11 月华南大区花费', index, run, workspace, graph, now,
+  values: { vocabulary, aliases: [], suppressions: loadSuppressions(workspace, graph) } });
+check('the other slices still answer', otherSlice.refusals.length === 0 && otherSlice.answer.answer.rows.length === 1,
+  JSON.stringify(otherSlice.answer?.answer?.rows));
+let badSuppression = null;
+try {
+  suppressValue({ workspace, graph, vocabulary, value: '东北', dimension: 'dim/region', reason: 'x', actor: 'alice' });
+} catch (error) {
+  badSuppression = error;
+}
+check('suppressing a value that does not exist is refused', badSuppression !== null, badSuppression?.message ?? '');
+let noReason = null;
+try {
+  suppressValue({ workspace, graph, vocabulary, word: '华东区', reason: '  ', actor: 'alice' });
+} catch (error) {
+  noReason = error;
+}
+check('a suppression without a reason is refused', noReason !== null, noReason?.message ?? '');
+
+section('13. determinism');
+
 const again = await askHybrid({ question: '2025 年 11 月各大区毛利', index, run, workspace, graph, now });
 check('the same question gives the same SQL', again.plan?.sql[0] === afterLearning.plan?.sql[0], 'identical statements');
 

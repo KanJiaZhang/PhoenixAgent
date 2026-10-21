@@ -176,6 +176,55 @@ export interface ValueAlias {
   note: string;
 }
 
+export interface ValueSuppression {
+  /** Either a word to never recognise, or a value to never recognise under one dimension. */
+  word?: string;
+  dimension?: string;
+  value?: string;
+  reason: string;
+  actor: string;
+  at: string;
+}
+
+export function suppressionPath(workspace: string, graph: string): string {
+  return join(workspace, 'values', `${graph}.denylist.jsonl`);
+}
+
+export function loadSuppressions(workspace: string, graph: string): ValueSuppression[] {
+  return readJsonl<ValueSuppression>(suppressionPath(workspace, graph));
+}
+
+/**
+ * Marks a word or a value as not answerable.
+ *
+ * The vocabulary is measured, and a measurement does not know that a warehouse value is an internal code that must not
+ * appear in a report. Suppression is that decision: it is recorded with a reason and an actor, it is applied before any
+ * matching happens, and a question that names a suppressed word is refused rather than answered without it.
+ */
+export function suppressValue(options: {
+  workspace: string; graph: string; vocabulary: ValueVocabulary;
+  word?: string; dimension?: string; value?: string;
+  reason: string; actor: string; now?: string;
+}): ValueSuppression {
+  const word = options.word?.trim();
+  if (!word && !options.value) throw new Error('a suppression needs a word or a value');
+  if (!options.reason.trim()) throw new Error('a suppression needs a reason: it is a decision about what may be answered');
+  if (options.value) {
+    const dimension = options.vocabulary.dimensions.find((entry) => entry.dimension === options.dimension || entry.name === options.dimension);
+    if (!dimension) throw new Error();
+    if (!dimension.values.includes(options.value)) {
+      throw new Error();
+    }
+  }
+  const entry: ValueSuppression = {
+    ...(word ? { word } : {}),
+    ...(options.value ? { dimension: options.dimension, value: options.value } : {}),
+    reason: options.reason, actor: options.actor, at: options.now ?? new Date().toISOString(),
+  };
+  appendJsonl(suppressionPath(options.workspace, options.graph), entry);
+  return entry;
+}
+
 export function loadAliases(workspace: string, graph: string): ValueAlias[] {
   return readJsonl<ValueAlias>(aliasPath(workspace, graph));
 }
@@ -216,7 +265,7 @@ export interface ValueMatch {
   filters: { dimension: string; value: string }[];
   matched: string[];
   /** A value that belongs to more than one dimension, or an unknown word sitting where a value should be. */
-  refusal?: { code: 'ambiguous-value' | 'unknown-value'; message: string; hint: string; candidates?: string[] };
+  refusal?: { code: 'ambiguous-value' | 'unknown-value' | 'out-of-scope'; message: string; hint: string; candidates?: string[] };
 }
 
 /**
@@ -230,8 +279,24 @@ export interface ValueMatch {
  *   know ("火星大区") is refused with the value list. Answering it for all regions would be a correct number to a
  *   different question, which is the worst outcome available here.
  */
-export function matchValues(question: string, index: ModelIndex, vocabulary: ValueVocabulary, aliases: ValueAlias[] = []): ValueMatch {
+export function matchValues(question: string, index: ModelIndex, vocabulary: ValueVocabulary, aliases: ValueAlias[] = [],
+  suppressions: ValueSuppression[] = []): ValueMatch {
   const text = question.trim();
+
+  // a suppressed word is refused before anything else: answering without it would be a correct number to a question
+  // nobody should be able to ask through this door
+  const suppressed = suppressions.find((entry) => (entry.word && text.includes(entry.word))
+    || (entry.value && text.includes(entry.value)));
+  if (suppressed) {
+    return {
+      filters: [], matched: [],
+      refusal: {
+        code: 'out-of-scope',
+        message: `「${suppressed.word ?? suppressed.value}」被屏蔽：${suppressed.reason}`,
+        hint: '这个取值不允许通过问数获取；如果这是误判，撤销屏蔽需要一次审查决定',
+      },
+    };
+  }
   const aliasHits = aliases.filter((alias) => text.includes(alias.word));
   const hits = new Map<string, { dimension: string; value: string }[]>();
   const matched: string[] = [];

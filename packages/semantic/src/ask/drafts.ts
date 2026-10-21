@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ModelIndex } from '../sql.ts';
 import { learnWord, loadLexicon, type LexiconEntry, type ProposalGateway } from './hybrid.ts';
+import { TimelineLog } from '../timeline.ts';
 
 export interface Draft {
   id: string;
@@ -101,6 +102,10 @@ export class DraftQueue {
       status: 'pending',
     };
     this.save([...this.all(), draft]);
+    new TimelineLog(this.workspace, this.graph).append({
+      at: draft.at, kind: 'draft', actor: draft.proposedBy,
+      detail: `proposed '${draft.word}' -> ${draft.target}`,
+    });
     return draft;
   }
 
@@ -125,6 +130,10 @@ export class DraftQueue {
     if (options.action === 'reject') {
       const rejected: Draft = { ...draft, status: 'rejected', reviewed };
       this.save(drafts.map((entry) => (entry.id === id ? rejected : entry)));
+      new TimelineLog(this.workspace, this.graph).append({
+        at: reviewed.at, kind: 'draft', actor: options.actor,
+        detail: `rejected '${draft.word}'${options.reason ? `: ${options.reason}` : ''}`,
+      });
       return { draft: rejected };
     }
     // the lexicon write happens here, through the same guard every other caller uses
@@ -135,6 +144,9 @@ export class DraftQueue {
     });
     const accepted: Draft = { ...draft, status: 'accepted', reviewed };
     this.save(drafts.map((item) => (item.id === id ? accepted : item)));
+    new TimelineLog(this.workspace, this.graph).append({
+      at: reviewed.at, kind: 'draft', actor: options.actor, detail: `accepted '${draft.word}' -> ${draft.target}`,
+    });
     return { draft: accepted, entry };
   }
 

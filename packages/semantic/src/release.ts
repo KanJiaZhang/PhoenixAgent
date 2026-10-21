@@ -16,7 +16,8 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { TimelineLog, releaseDetail } from './timeline.ts';
+import { dirname, join } from 'node:path';
 
 export interface ReleaseConfig {
   graph: string;
@@ -114,6 +115,16 @@ export class ReleaseStore {
   private log(event: ReleaseEvent): void {
     mkdirSync(join(this.eventsPath, '..'), { recursive: true });
     appendFileSync(this.eventsPath, `${JSON.stringify(event)}\n`, 'utf8');
+    // the same decision, written once, where the timeline reads it
+    if (event.kind !== 'answer') {
+      new TimelineLog(dirname(this.eventsPath).replace(/[\\/]release$/, ''), this.graph).append({
+        at: event.ts,
+        kind: 'release',
+        actor: event.actor,
+        detail: releaseDetail({ kind: event.kind, revision: event.revision, ...(event.detail ? { detail: event.detail } : {}) }),
+        revision: event.revision,
+      });
+    }
   }
 
   start(options: {

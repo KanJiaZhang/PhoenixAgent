@@ -30,6 +30,7 @@ import { interpret, type PeriodGrain, type PeriodSpec, type QuerySpec, type Valu
 import { ask, translate, type AskResult, type SemanticPlan } from './query.ts';
 import type { QueryRunner } from '../../../dataplane/src/sqlite.ts';
 import { appendJsonl, readJsonl } from '../../../core/src/workspace.ts';
+import { TimelineLog } from '../timeline.ts';
 import { join } from 'node:path';
 
 /** The slice of the LLM gateway this module needs; a fake with the same shape is enough to test it. */
@@ -238,6 +239,12 @@ export function learnWord(options: {
     evidence: options.evidence ?? '',
   };
   appendJsonl(lexiconPath(options.workspace, options.graph), entry);
+  new TimelineLog(options.workspace, options.graph).append({
+    at: entry.at,
+    kind: 'lexicon',
+    actor: entry.model,
+    detail: `learned '${entry.word}' -> ${entry.target}${entry.evidence ? ` (${entry.evidence.slice(0, 80)})` : ''}`,
+  });
   return entry;
 }
 

@@ -22,7 +22,7 @@
 import type { AgentRefusal } from '../../../core/src/result.ts';
 import type { ModelIndex } from '../sql.ts';
 import { tableOfColumnId } from '../sql.ts';
-import { matchValues, type ValueAlias, type ValueVocabulary } from './values.ts';
+import { matchValues, type ValueAlias, type ValueSuppression, type ValueVocabulary } from './values.ts';
 
 export type PeriodGrain = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
@@ -60,6 +60,8 @@ export interface QuerySpec {
 export interface ValueContext {
   vocabulary: ValueVocabulary;
   aliases?: ValueAlias[];
+  /** Words or values that may not be answered at all. */
+  suppressions?: ValueSuppression[];
 }
 
 export interface Interpretation {
@@ -191,7 +193,9 @@ export function interpret(question: string, index: ModelIndex, now = new Date(),
   }
 
   // value words become filters, or a refusal - never a silent "all regions"
-  const valueMatch = values ? matchValues(text, index, values.vocabulary, values.aliases ?? []) : { filters: [], matched: [] };
+  const valueMatch = values
+    ? matchValues(text, index, values.vocabulary, values.aliases ?? [], values.suppressions ?? [])
+    : { filters: [], matched: [] };
   if ("refusal" in valueMatch && valueMatch.refusal) {
     return { spec: null, refusals: [{ ...valueMatch.refusal }], notes };
   }

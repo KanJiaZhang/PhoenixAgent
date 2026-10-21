@@ -238,6 +238,32 @@ try {
     unfiltered.body.plan.modelRevision === null || unfiltered.body.plan.modelRevision === 1, `${unfiltered.body.plan.modelRevision}`);
   await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'slice test done' }, 'owner');
 
+  section('7c. the slice can come from the words, once a vocabulary exists');
+  // without a vocabulary the same question is not a slice, which is the documented limit
+  const withoutVocabulary = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 2, canaryPct: 100,
+    scope: { dimension: 'dim/region', values: ['华东'] },
+    retry: { reason: 'vocabulary test A' },
+  }, 'owner');
+  checkEqual('the release starts scoped to the slice', withoutVocabulary.status, 200);
+  const noVocabularyAsk = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东大区花费' }, 'canary-key');
+  check('without a vocabulary, a word is not a slice and stays stable',
+    noVocabularyAsk.body.plan.modelRevision === null || noVocabularyAsk.body.plan.modelRevision === 1,
+    String(noVocabularyAsk.body.plan.modelRevision));
+  const vocabulary = await http('POST', '/v1/semantic/values', { action: 'build' }, 'analyst');
+  checkEqual('the vocabulary builds', vocabulary.status, 200);
+  const wordSlice = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东大区花费' }, 'canary-key');
+  checkEqual('now the word routes to the canary', wordSlice.body.plan.modelRevision, 2);
+  const otherWord = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华南大区花费' }, 'canary-key');
+  check('another slice still stays stable',
+    otherWord.body.plan.modelRevision === null || otherWord.body.plan.modelRevision === 1,
+    String(otherWord.body.plan.modelRevision));
+  const noSlice = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月大区花费' }, 'canary-key');
+  check('and a question about every region is not the slice',
+    noSlice.body.plan.modelRevision === null || noSlice.body.plan.modelRevision === 1,
+    String(noSlice.body.plan.modelRevision));
+  await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'vocabulary slice test done' }, 'owner');
+
   section('8. a canary whose number moves is a failure, not just a slow release');
   const guarded = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, qualityGuard: { maxRelativeDelta: 0.02 },
@@ -310,9 +336,16 @@ try {
   check('the auto rollback is attributed to the guard', timeline.body.events.some((event) => event.actor === 'canary-guard'),
     timeline.body.counts.release + ' release events');
   checkEqual('the learned word is on the timeline', timeline.body.counts.lexicon, 1);
+  check('the timeline names the log it now reads', /timeline[\/]demo-analytics\.jsonl$/.test((timeline.body.sources.log ?? '').replaceAll('\\', '/')),
+    timeline.body.sources.log ?? 'missing');
+  const timelineLog = readFileSync(join(workspace, 'timeline', graph + '.jsonl'), 'utf8').trim().split(String.fromCharCode(10)).map((line) => JSON.parse(line));
+  check('release decisions are written to the log, not only to their own file',
+    timelineLog.filter((entry) => entry.kind === 'release').length > 0, `${timelineLog.length} logged entries`);
+  check('and the timeline counts them once', timeline.body.counts.release >= timelineLog.filter((entry) => entry.kind === 'release').length,
+    `${timeline.body.counts.release} on the timeline vs ${timelineLog.filter((entry) => entry.kind === 'release').length} in the log`);
   const sorted = timeline.body.events.every((event, index, all) => index === 0 || all[index - 1].at <= event.at);
   check('the events are in order', sorted, `${timeline.body.events.length} events`);
-  check('each kind names its source file', Object.values(timeline.body.sources).every((source) => source.includes('release') || source.includes('lexicon') || source.includes('reviews') || source.includes('audit')),
+  check('each kind names its source file', Object.values(timeline.body.sources).every((source) => ['release', 'lexicon', 'reviews', 'audit', 'timeline'].some((name) => source.includes(name))),
     Object.keys(timeline.body.sources).length + ' sources');
   const again2 = await http('GET', '/v1/semantic/timeline?limit=500');
   checkEqual('and the same history gives the same timeline', JSON.stringify(again2.body.events), JSON.stringify(timeline.body.events));
