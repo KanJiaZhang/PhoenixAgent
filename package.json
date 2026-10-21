@@ -1,0 +1,44 @@
+{
+  "name": "phoenix-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PhoenixAgent - enterprise data agent. Semantic layer construction, shared SQL layer, skills and the business sub-agents.",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "verify:p0": "node scripts/verify-p0.mjs",
+    "verify:m2": "node scripts/verify-m2.mjs",
+    "demo:db": "node scripts/build-demo-db.mjs",
+    "semantic": "node packages/semantic/src/cli.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify:m3": "node scripts/verify-m3.mjs",
+    "sql": "node packages/sqllayer/src/cli.ts",
+    "demo:pdf": "node scripts/build-fixture-pdf.mjs",
+    "verify:m4": "node scripts/verify-m4.mjs",
+    "skills": "node packages/skills/src/cli.ts",
+    "verify:m5": "node scripts/verify-m5.mjs",
+    "attribute": "node packages/agents/attribution/src/cli.ts",
+    "verify:m6": "node scripts/verify-m6.mjs",
+    "campaign": "node packages/agents/campaign/src/cli.ts",
+    "verify:m7": "node scripts/verify-m7.mjs",
+    "risk": "node packages/agents/risk/src/cli.ts",
+    "serve": "node packages/api/src/bin.ts",
+    "verify:m8": "node scripts/verify-m8.mjs",
+    "verify:m2q": "node scripts/verify-m2q.mjs",
+    "verify:m2x": "node scripts/verify-m2x.mjs",
+    "example:risk": "node examples/risk-strategy.mjs",
+    "example:growth": "node examples/attribution-campaign.mjs",
+    "example:audit": "node examples/risk-rule-audit.mjs",
+    "example:stoploss": "node examples/growth-stop-loss.mjs",
+    "examples": "node examples/risk-strategy.mjs && node examples/risk-rule-audit.mjs && node examples/attribution-campaign.mjs && node examples/growth-stop-loss.mjs"
+  },
+  "dependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

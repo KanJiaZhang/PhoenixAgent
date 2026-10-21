@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PhoenixAgent · 工作台</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1b1b1f; --bg:#fbfbfd; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --warn:#b45309; --bad:#b91c1c; --ok:#047857; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e6e6e9; --bg:#141417; --muted:#9ca3af; --line:#2a2a31; --accent:#6ea8fe; --warn:#f59e0b; --bad:#f87171; --ok:#34d399; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; color:var(--fg); background:var(--bg); }
+  header { display:flex; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); }
+  header h1 { font-size:15px; margin:0 12px 0 0; font-weight:600; }
+  nav { display:flex; gap:4px; }
+  nav button { border:1px solid transparent; background:none; color:var(--muted); padding:6px 10px; border-radius:6px; cursor:pointer; }
+  nav button.active { color:var(--fg); border-color:var(--line); }
+  #key { margin-left:auto; width:220px; }
+  main { padding:16px; max-width:1200px; }
+  section { display:none; } section.active { display:block; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  input, textarea, button { font:inherit; color:inherit; }
+  input, textarea { background:transparent; border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  textarea { width:100%; min-height:90px; font-family:ui-monospace, Consolas, monospace; font-size:12px; }
+  button { border:1px solid var(--line); background:none; border-radius:6px; padding:5px 10px; cursor:pointer; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  pre { background:color-mix(in srgb, var(--fg) 5%, transparent); padding:10px; border-radius:6px; overflow:auto; font-size:12px; max-height:340px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  .muted { color:var(--muted); } .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .pill { border:1px solid var(--line); border-radius:99px; padding:1px 8px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PhoenixAgent</h1>
+  <nav>
+    <button data-tab="semantic" class="active">语义审查</button>
+    <button data-tab="sql">SQL 工作台</button>
+    <button data-tab="skills">Skill 库</button>
+    <button data-tab="agents">业务 Agent</button>
+  </nav>
+  <input id="key" placeholder="X-API-Key（owner/analyst/viewer）">
+</header>
+<main>
+  <section id="semantic" class="active">
+    <div class="row">
+      <button class="primary" data-act="semantic-load">加载模型</button>
+      <button data-act="semantic-report">看门禁/覆盖率</button>
+      <button data-act="semantic-build">重建</button>
+      <button data-act="semantic-publish">发布（owner）</button>
+      <span id="semantic-summary" class="muted"></span>
+    </div>
+    <div id="semantic-review"></div>
+    <pre id="semantic-out" class="muted">加载后显示需要审查的候选。</pre>
+  </section>
+
+  <section id="sql">
+    <textarea id="sql-input">SELECT * FROM fact_order WHERE substr(order_date, 1, 7) = '2024-05'</textarea>
+    <div class="row">
+      <input id="sql-required" placeholder="调用方需要的列（逗号分隔，可空）" style="flex:1">
+      <button class="primary" data-act="sql-plan">分析并改写</button>
+      <button data-act="sql-state">回放账本</button>
+    </div>
+    <pre id="sql-out" class="muted">Plan 之后每一步都可以单独应用/撤销，人改也会记账。</pre>
+  </section>
+
+  <section id="skills">
+    <div class="row">
+      <button class="primary" data-act="skills-load">加载</button>
+      <input id="advise-sql" placeholder="用一条 SQL 检索适用的 tip" style="flex:1">
+      <button data-act="skills-advise">检索</button>
+      <button data-act="skills-export">导出 SKILL.md</button>
+    </div>
+    <div id="skills-list"></div>
+    <pre id="skills-out" class="muted"></pre>
+  </section>
+
+  <section id="agents">
+    <div class="row">
+      <input id="ask-input" placeholder="问一句话：为什么 11 月花费涨了 / 哪个大区该加投 / 最近欺诈趋势" style="flex:1">
+      <button class="primary" data-act="ask">问</button>
+    </div>
+    <div class="row">
+      <input id="attr-metric" value="roi" size="8">
+      <input id="attr-from" value="2025-10" size="8">
+      <input id="attr-to" value="2025-11" size="8">
+      <button data-act="attr">归因</button>
+      <button data-act="campaign">投放分配</button>
+      <button data-act="risk">风控报告</button>
+    </div>
+    <div id="agents-out"></div>
+  </section>
+</main>
+<script src="/console.js"></script>
+</body>
+</html>

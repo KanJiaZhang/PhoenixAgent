@@ -1,0 +1,33 @@
+# PhoenixAgent + PhoenixGraph + the demo warehouse.
+#
+# Two ways to run it:
+#
+#   docker compose up agent                 # the agent alone: console, attribution, campaign, risk, SQL, skills
+#   docker compose --profile full up        # plus PhoenixGraph, needed for publishing a model and for /v1/ask
+#
+# The agent is useful without the base on purpose: everything except "publish the model into the graph" and
+# "answer a factual question from the graph" runs on the demo warehouse in this repository.
+
+services:
+  agent:
+    build:
+      context: .
+    environment:
+      PAGENT_API_KEYS: ${PAGENT_API_KEYS:-}
+      PHOENIXGRAPH_API: http://phoenixgraph:8081
+      PAGENT_GRAPH: demo-analytics
+    ports:
+      - "8790:8790"
+    volumes:
+      - agent-data:/data
+
+  phoenixgraph:
+    profiles: ["full"]
+    # build the base from the sibling checkout; it exposes the semantic and analysis APIs on 8081
+    build:
+      context: ../PhoenixGraph
+    ports:
+      - "8081:8081"
+
+volumes:
+  agent-data:

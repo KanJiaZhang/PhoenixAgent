@@ -1,0 +1,26 @@
+{
+  "id": "risk-strategy",
+  "name": "风控策略 Agent",
+  "domain": "risk",
+  "version": "1.0",
+  "question": "最近欺诈趋势如何？哪些特征真的有效？给我一条可以上线的规则，并告诉我它在离线上能抓多少。",
+  "routes": { "type": "detective", "agent": "risk", "signals": ["欺诈", "风控", "规则", "特征", "召回"] },
+  "model": {
+    "graph": "demo-analytics",
+    "features": "feature_snapshot/feature_registry（point-in-time 校验）",
+    "labels": "risk_event.is_fraud + label_date"
+  },
+  "tools": ["risk.report", "risk.approvals"],
+  "gates": {
+    "holdoutMonths": 3,
+    "minZ": 4,
+    "minPrecision": 0.75,
+    "minRecall": 0.15,
+    "maxConditions": 3,
+    "requireApproval": true,
+    "ruleNeverAutoPublishes": true
+  },
+  "budget": { "maxQueries": 40, "maxMs": 60000 },
+  "skills": { "scopes": ["risk"], "harvest": true },
+  "outputs": ["trend.json", "features.json", "rules.json", "approval.json", "skills.json"]
+}

@@ -1,0 +1,4 @@
+{
+  "excludeTables": ["risk_event", "feature_snapshot", "feature_registry", "risk_rule"],
+  "reason": "风控域由 M7 自己的特征仓与规则集管理；它进投放语义层只会制造无关维度（例如 is_fraud）并稀释覆盖率。多域边界是数据，不是代码里的规则。"
+}

@@ -1,0 +1,28 @@
+{
+  "id": "growth-stop-loss",
+  "name": "止损归因 + 砍预算决策 Agent",
+  "domain": "growth",
+  "version": "1.0",
+  "question": "ROI 被摊薄了，哪些 cell 在亏钱？该砍多少、砍哪里？砍了以后怎么验证不是把生意砍坏了？",
+  "routes": {
+    "diagnostic": { "agent": "attribution", "signals": ["ROI", "为什么", "摊薄"] },
+    "prescriptive": { "agent": "campaign", "signals": ["砍", "止损", "预算"] }
+  },
+  "model": { "graph": "demo-analytics", "semantic": "ROI 两因子 + capture_rate 跨事实" },
+  "tools": ["attribution", "semantic.ask", "campaign.optimize"],
+  "gates": {
+    "attribution": { "maxDepth": 1, "maxQueries": 40, "residualMustBeReported": true },
+    "campaign": {
+      "budgetFactor": 0.85,
+      "objective": "profit",
+      "budgetIsCap": true,
+      "maxChangePct": 0.5,
+      "minGainOverNoise": 1,
+      "requireSwitchback": true
+    },
+    "crossFactCheck": { "metric": "metric/capture_rate", "requiresReviewFirst": true }
+  },
+  "budget": { "maxQueries": 60, "maxMs": 20000 },
+  "skills": { "scopes": ["attribution", "campaign"], "harvest": true },
+  "outputs": ["roi-attribution.json", "cross-check.json", "stop-loss-plan.json", "handoff.md", "skills.json"]
+}

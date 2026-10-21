@@ -1,0 +1,6 @@
+node_modules/
+.pag/
+.pag-*/
+fixtures/demo/data/*.db
+*.log
+.tsbuildinfo

@@ -1,0 +1,17 @@
+{
+  "id": "attribution-campaign",
+  "name": "归因 + 市场决策 Agent",
+  "domain": "growth",
+  "version": "1.0",
+  "question": "11 月花费为什么涨了？下一周期预算该往哪里调、调多少、怎么验证？",
+  "routes": { "type": "diagnostic", "agent": "attribution", "signals": ["为什么", "归因", "预算", "加投", "分配"] },
+  "model": { "graph": "demo-analytics", "semantic": "metrics spend/revenue/roi + dims region/industry/channel" },
+  "tools": ["attribution", "campaign.optimize"],
+  "gates": {
+    "attribution": { "maxDepth": 2, "maxQueries": 40, "pruneShare": 0.02, "expandShare": 0.25, "residualMustBeReported": true },
+    "campaign": { "maxChangePct": 0.5, "minShare": 0.005, "maxShare": 0.35, "minGainOverNoise": 1, "holdout": true }
+  },
+  "budget": { "maxQueries": 60, "maxMs": 15000 },
+  "skills": { "scopes": ["attribution", "campaign"], "harvest": true },
+  "outputs": ["attribution.json", "campaign.json", "handoff.md", "skills.json"]
+}

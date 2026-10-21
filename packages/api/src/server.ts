@@ -1,0 +1,742 @@
+/**
+ * M8: one HTTP surface for the seven tools, with roles, an audit trail, and a console.
+ *
+ * The design constraint is that **the catalogue is generated from the routes**. `/v1/tools` is built by walking
+ * the same table the dispatcher uses, so a tool cannot be advertised without a handler, and the MCP server
+ * (which reads that catalogue) cannot drift from the service. That is the same rule the base applies to its own
+ * 13 tools, kept here on purpose.
+ *
+ * What the endpoints are *not*: a second implementation. Every handler calls the module the CLI calls - the
+ * semantic pipeline, the attribution loop, the campaign agent, the risk agent, the SQL workspace, the skill
+ * store. The API adds three things and only three: authentication/roles, the confirm-token gate for plans, and
+ * an audit line per request.
+ */
+
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
+import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { loadConfig } from '../../core/src/config.ts';
+import { GraphClient, PhoenixGraphError } from '../../core/src/graph-client.ts';
+import { appendJsonl, readJson, readJsonl } from '../../core/src/workspace.ts';
+import { route } from '../../core/src/router.ts';
+import { assertReadOnly } from '../../dataplane/src/guard.ts';
+import { readSqliteCatalog, sqliteRunner, type QueryRunner } from '../../dataplane/src/sqlite.ts';
+import { indexModel, type ModelIndex } from '../../semantic/src/sql.ts';
+import { build, rebuildReport, loadBuild } from '../../semantic/src/pipeline.ts';
+import { ReviewLog } from '../../semantic/src/review.ts';
+import { publish, exportAnalytical } from '../../semantic/src/publish.ts';
+import { ask as semanticAsk, translate as semanticTranslate } from '../../semantic/src/ask/index.ts';
+import { SqlWorkspace } from '../../sqllayer/src/steps.ts';
+import { SkillStore } from '../../skills/src/types.ts';
+import { advise } from '../../skills/src/advise.ts';
+import { toSkillMarkdown } from '../../skills/src/export.ts';
+import { attribute } from '../../agents/attribution/src/index.ts';
+import { campaign } from '../../agents/campaign/src/index.ts';
+import { riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
+import { authenticate, loadAuth, requireRole, Forbidden, Unauthorized, type AuthConfig, type Principal, type Role } from './auth.ts';
+import { ConfirmTokens, ConfirmationRejected } from './confirm.ts';
+
+export interface ServerOptions {
+  port?: number;
+  workspace?: string;
+  fixtures?: string;
+  graph?: string;
+  auth?: AuthConfig;
+  confirmSecret?: string;
+  now?: () => string;
+  /** Console assets live here; defaults to this source directory. */
+  assetDir?: string;
+}
+
+export interface AgentServer {
+  server: Server;
+  listen(): Promise<string>;
+  close(): Promise<void>;
+  auth: AuthConfig;
+}
+
+interface Context {
+  options: Required<Pick<ServerOptions, 'workspace' | 'fixtures' | 'graph' | 'now' | 'assetDir'>>;
+  auth: AuthConfig;
+  tokens: ConfirmTokens;
+  config: ReturnType<typeof loadConfig>;
+  auditPath: string;
+}
+
+interface Request {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  params: Record<string, string>;
+  body: Record<string, unknown>;
+  principal: Principal;
+}
+
+type Handler = (request: Request, context: Context) => Promise<unknown> | unknown;
+
+interface RouteDef {
+  method: 'GET' | 'POST';
+  path: string;
+  /** Minimum role. */
+  role: Role;
+  summary: string;
+  /** Parameters, for the catalogue. */
+  input: string[];
+  handler: Handler;
+}
+
+export class HttpError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly hint?: string;
+  constructor(status: number, code: string, message: string, hint?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.hint = hint;
+    this.name = 'HttpError';
+  }
+}
+
+const MAX_BODY = 2 * 1024 * 1024;
+
+export function createAgentServer(options: ServerOptions = {}): AgentServer {
+  const config = loadConfig();
+  const context: Context = {
+    options: {
+      workspace: options.workspace ?? config.workspace,
+      fixtures: options.fixtures ?? config.fixtures,
+      graph: options.graph ?? 'demo-analytics',
+      now: options.now ?? (() => new Date().toISOString()),
+      assetDir: options.assetDir ?? new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'),
+    },
+    auth: options.auth ?? loadAuth(),
+    tokens: new ConfirmTokens(options.confirmSecret ?? process.env.PAGENT_CONFIRM_SECRET ?? randomSecret()),
+    config,
+    auditPath: join(options.workspace ?? config.workspace, 'audit', 'api.jsonl'),
+  };
+
+  const routes = buildRoutes();
+  const server = createServer((request, response) => {
+    void handle(request, response, context, routes);
+  });
+  return {
+    server,
+    auth: context.auth,
+    listen: () => new Promise<string>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.port ?? 0, '127.0.0.1', () => {
+        const address = server.address();
+        resolve(typeof address === 'object' && address ? `http://127.0.0.1:${address.port}` : String(address));
+      });
+    }),
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    }),
+  };
+}
+
+async function handle(request: IncomingMessage, response: ServerResponse, context: Context, routes: RouteDef[]): Promise<void> {
+  const started = Date.now();
+  const url = new URL(request.url ?? '/', 'http://localhost');
+  const method = (request.method ?? 'GET').toUpperCase();
+  let status = 200;
+  let actor = 'anonymous';
+
+  try {
+    // static console assets, no auth: it is a page shell, every call it makes is authenticated
+    if (method === 'GET' && (url.pathname === '/' || url.pathname === '/console.js' || url.pathname === '/console.css')) {
+      const file = url.pathname === '/' ? 'console.html' : url.pathname.slice(1);
+      const asset = readAsset(context.options.assetDir, file);
+      status = asset ? 200 : 404;
+      response.writeHead(status, { 'content-type': file.endsWith('.js') ? 'text/javascript; charset=utf-8'
+        : file.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/html; charset=utf-8' });
+      response.end(asset ?? 'not found');
+      return;
+    }
+
+    if (method === 'GET' && url.pathname === '/v1/health') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true, service: 'PhoenixAgent', at: context.options.now() }));
+      return;
+    }
+
+    const principal = authenticate(context.auth, headerValue(request.headers['x-api-key']));
+    actor = principal.actor;
+
+    const match = matchRoute(routes, method, url.pathname);
+    if (!match) {
+      const allowed = routes.filter((entry) => entry.path === url.pathname).map((entry) => entry.method);
+      throw allowed.length > 0
+        ? new HttpError(405, 'method-not-allowed', `${method} ${url.pathname} is not a route`, `try ${allowed.join(' or ')}`)
+        : new HttpError(404, 'not-found', `no route for ${method} ${url.pathname}`, 'GET /v1/tools lists what exists');
+    }
+    requireRole(principal, match.route.role);
+    const body = method === 'POST' ? await readBody(request) : {};
+    const result = await match.route.handler({
+      method,
+      path: url.pathname,
+      query: url.searchParams,
+      params: match.params,
+      body,
+      principal,
+    }, context);
+    response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    response.end(JSON.stringify(result));
+  } catch (error) {
+    const failure = toHttpError(error);
+    status = failure.status;
+    response.writeHead(failure.status, { 'content-type': 'application/json; charset=utf-8' });
+    response.end(JSON.stringify({
+      error: {
+        code: failure.code,
+        message: failure.message,
+        ...(failure.hint ? { hint: failure.hint } : {}),
+      },
+    }));
+  } finally {
+    appendJsonl(context.auditPath, {
+      ts: context.options.now(), actor, method, path: url.pathname, status, ms: Date.now() - started,
+    });
+  }
+}
+
+function toHttpError(error: unknown): HttpError {
+  if (error instanceof HttpError) return error;
+  if (error instanceof Unauthorized) return new HttpError(error.status, 'unauthorized', error.message);
+  if (error instanceof Forbidden) return new HttpError(error.status, 'forbidden', error.message);
+  if (error instanceof ConfirmationRejected) return new HttpError(error.status, error.code, error.message);
+  if (error instanceof PhoenixGraphError) return new HttpError(502, 'base-unavailable', error.message, 'the base answers on PHOENIXGRAPH_API');
+  return new HttpError(500, 'internal', (error as Error).message);
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+async function readBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw new HttpError(413, 'body-too-large', `request body over ${MAX_BODY} bytes`);
+    chunks.push(chunk as Buffer);
+  }
+  if (chunks.length === 0) return {};
+  const text = Buffer.concat(chunks).toString('utf8');
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new HttpError(400, 'body-not-object', 'the body must be a JSON object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, 'body-not-json', (error as Error).message);
+  }
+}
+
+function readAsset(dir: string, file: string): string | null {
+  const path = join(dir, file);
+  return existsSync(path) ? readFileSync(path, 'utf8') : null;
+}
+
+function matchRoute(routes: RouteDef[], method: string, path: string): { route: RouteDef; params: Record<string, string> } | null {
+  for (const route of routes) {
+    if (route.method !== method) continue;
+    if (route.path === path) return { route, params: {} };
+    if (!route.path.includes(':')) continue;
+    const routeParts = route.path.split('/');
+    const pathParts = path.split('/');
+    if (routeParts.length !== pathParts.length) continue;
+    const params: Record<string, string> = {};
+    let matches = true;
+    for (let index = 0; index < routeParts.length; index++) {
+      const expected = routeParts[index]!;
+      const actual = pathParts[index]!;
+      if (expected.startsWith(':')) params[expected.slice(1)] = decodeURIComponent(actual);
+      else if (expected !== actual) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return { route, params };
+  }
+  return null;
+}
+
+function randomSecret(): string {
+  return `local-${Math.random().toString(36).slice(2)}${Date.now()}`;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// the workspace accessors: one DB handle per request, model cached per build file mtime
+
+function withDatabase<T>(context: Context, fn: (run: QueryRunner, catalog: ReturnType<typeof readSqliteCatalog>) => T): T {
+  const dbPath = join(context.options.fixtures, 'data', 'demo.db');
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const catalog = readSqliteCatalog(db, dbPath);
+    const runner = sqliteRunner(db, { rowLimit: 200_000, timeoutMs: 30_000 });
+    return fn((sql: string) => {
+      assertReadOnly(sql);
+      return runner(sql);
+    }, catalog);
+  } finally {
+    db.close();
+  }
+}
+
+function loadModel(context: Context, graph = context.options.graph): {
+  index: ModelIndex;
+  report: Record<string, unknown> | null;
+  candidates: { id: string; status: string; entityType?: string; kind?: string; payload: unknown; note?: string }[];
+} {
+  const stored = loadBuild({ fixtures: context.options.fixtures, graph, workspace: context.options.workspace, now: context.options.now() });
+  if (!stored) {
+    throw new HttpError(409, 'no-model', `no build for '${graph}'`, `POST /v1/semantic/build {"graph":"${graph}"} first`);
+  }
+  const report = readJson<Record<string, unknown>>(join(context.options.workspace, 'build', graph, 'report.json'));
+  return { index: indexModel(stored.candidates), report, candidates: stored.candidates };
+}
+
+function requireString(body: Record<string, unknown>, name: string): string {
+  const value = body[name];
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new HttpError(400, 'missing-parameter', `'${name}' is required`, `send JSON {"${name}": "..."}`);
+  }
+  return value;
+}
+
+function optionalNumber(body: Record<string, unknown>, name: string): number | undefined {
+  const value = body[name];
+  if (value === undefined || value === null) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new HttpError(400, 'bad-parameter', `'${name}' must be a number`);
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// the routes
+
+function buildRoutes(): RouteDef[] {
+  return [
+    {
+      method: 'GET', path: '/v1/tools', role: 'viewer',
+      summary: 'the tool catalogue (generated from these routes)', input: [],
+      handler: (_request, _context) => ({ tools: buildRoutes().map(describeRoute) }),
+    },
+    {
+      method: 'POST', path: '/v1/route', role: 'viewer',
+      summary: 'which sub-agent a question belongs to, and why', input: ['question'],
+      handler: (request) => {
+        const question = requireString(request.body, 'question');
+        return route(question);
+      },
+    },
+    {
+      method: 'POST', path: '/v1/ask', role: 'viewer',
+      summary: 'ask anything: routes to the semantic, attribution, campaign or risk agent',
+      input: ['question', 'mode', 'confirmToken', 'from', 'to', 'metric'],
+      handler: askHandler,
+    },
+    {
+      method: 'POST', path: '/v1/attribute', role: 'viewer',
+      summary: 'attribute a metric change to drivers and slices, with residual reported', input: ['metric', 'from', 'to', 'depth'],
+      handler: (request, context) => {
+        const metric = requireString(request.body, 'metric');
+        const from = requireString(request.body, 'from');
+        const to = requireString(request.body, 'to');
+        return confirmable(request, 'attribute', { metric, from, to, depth: optionalNumber(request.body, 'depth') ?? 2 }, executeAttribute, context);
+      },
+    },
+    {
+      method: 'POST', path: '/v1/campaign/optimize', role: 'viewer',
+      summary: 'marginal response curves, a bounded budget reallocation and a holdout design', input: ['budget', 'maxChangePct'],
+      handler: (request, context) => {
+        const plan = { budget: optionalNumber(request.body, 'budget'), maxChangePct: optionalNumber(request.body, 'maxChangePct') };
+        return confirmable(request, 'campaign', plan, executeCampaign, context);
+      },
+    },
+    {
+      method: 'GET', path: '/v1/risk/report', role: 'viewer',
+      summary: 'trend, feature effectiveness, synthesized rules and their holdout metrics', input: [],
+      handler: (_request, context) => executeRisk(context, {}),
+    },
+    {
+      method: 'POST', path: '/v1/risk/approve', role: 'owner',
+      summary: 'approve or reject a rule candidate (this is the only way a rule publishes)', input: ['ruleId', 'decision', 'expression', 'note'],
+      handler: (request, context) => {
+        const ruleId = requireString(request.body, 'ruleId');
+        const decision = requireString(request.body, 'decision');
+        if (decision !== 'approve' && decision !== 'reject') {
+          throw new HttpError(400, 'bad-parameter', "decision must be 'approve' or 'reject'");
+        }
+        return new RiskApprovals(context.options.workspace, context.options.graph)
+          .decide(ruleId, String(request.body.expression ?? ''), decision, request.principal.actor,
+            String(request.body.note ?? ''), context.options.now());
+      },
+    },
+    {
+      method: 'GET', path: '/v1/risk/approvals', role: 'viewer',
+      summary: 'the approval log', input: [],
+      handler: (_request, context) => ({ approvals: new RiskApprovals(context.options.workspace, context.options.graph).all() }),
+    },
+    {
+      method: 'GET', path: '/v1/semantic/report', role: 'viewer',
+      summary: 'the gate, coverage, completeness and drift of the current build', input: ['graph'],
+      handler: (request, context) => {
+        const graph = request.query.get('graph') ?? context.options.graph;
+        const { report } = loadModel(context, graph);
+        if (!report) throw new HttpError(404, 'no-report', `no report for '${graph}'`);
+        return report;
+      },
+    },
+    {
+      method: 'GET', path: '/v1/semantic/model', role: 'viewer',
+      summary: 'the semantic model: metrics, dimensions, relations, and the candidates that are not accepted', input: ['graph'],
+      handler: (request, context) => {
+        const graph = request.query.get('graph') ?? context.options.graph;
+        const { index, candidates } = loadModel(context, graph);
+        const byType = (type: string) => index.candidates.filter((candidate) => candidate.entityType === type)
+          .map((candidate) => ({ id: candidate.id, payload: candidate.payload, status: candidate.status, note: candidate.note }));
+        return {
+          graph,
+          metrics: byType('metric'),
+          dimensions: byType('dimension'),
+          tables: byType('table'),
+          relations: index.candidates.filter((candidate) => candidate.kind === 'relation')
+            .map((candidate) => ({ id: candidate.id, type: candidate.relationType, from: candidate.from, to: candidate.to })),
+          needsReview: candidates.filter((candidate) => candidate.status === 'needs_review').map((candidate) => candidate.id),
+        };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/translate', role: 'viewer',
+      summary: 'a question or a spec becomes SQL, with the SQL layer findings - nothing runs', input: ['question', 'spec', 'graph'],
+      handler: (request, context) => {
+        const { index, report } = loadModel(context, String(request.body.graph ?? context.options.graph));
+        return semanticTranslate({
+          ...(typeof request.body.question === 'string' ? { question: request.body.question } : {}),
+          ...(request.body.spec ? { spec: request.body.spec as never } : {}),
+          index,
+          modelRevision: typeof report?.modelVersion === 'number' ? report.modelVersion : null,
+        });
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/ask', role: 'viewer',
+      summary: 'a question over the semantic model: interpret, render, execute, explain', input: ['question', 'spec', 'graph', 'compare'],
+      handler: (request, context) => {
+        const { index, report } = loadModel(context, String(request.body.graph ?? context.options.graph));
+        const spec = request.body.spec as Record<string, unknown> | undefined;
+        const merged = spec
+          ? { ...spec, ...(request.body.compare ? { compare: request.body.compare } : {}) }
+          : undefined;
+        return withDatabase(context, (run) => semanticAsk({
+          ...(typeof request.body.question === 'string' ? { question: request.body.question } : {}),
+          ...(merged ? { spec: merged as never } : {}),
+          index,
+          run,
+          modelRevision: typeof report?.modelVersion === 'number' ? report.modelVersion : null,
+        }));
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/validate', role: 'viewer',
+      summary: 'compile the SQL for a question without executing it', input: ['question', 'spec', 'graph'],
+      handler: (request, context) => {
+        const { index, report } = loadModel(context, String(request.body.graph ?? context.options.graph));
+        const translated = semanticTranslate({
+          ...(typeof request.body.question === 'string' ? { question: request.body.question } : {}),
+          ...(request.body.spec ? { spec: request.body.spec as never } : {}),
+          index,
+          modelRevision: typeof report?.modelVersion === 'number' ? report.modelVersion : null,
+        });
+        if (!translated.plan) return { ok: false, refusals: translated.refusals };
+        const plan = translated.plan;
+        return withDatabase(context, (run) => {
+          try {
+            run(`${plan.sql[0]} LIMIT 0`);
+            return { ok: true, sql: plan.sql[0], findings: plan.findings };
+          } catch (error) {
+            return { ok: false, sql: plan.sql[0], error: (error as Error).message };
+          }
+        });
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/build', role: 'analyst',
+      summary: 'rebuild the semantic model from the fixture sources', input: ['graph', 'includeInjected'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const start = Date.now();
+        const outcome = build({
+          fixtures: context.options.fixtures, graph, workspace: context.options.workspace,
+          now: context.options.now(), includeInjected: request.body.includeInjected === true,
+        });
+        return {
+          graph, modelVersion: outcome.modelVersion, gate: outcome.report.gate,
+          coverage: outcome.report.coverage, conflicts: outcome.report.conflicts,
+          needsReview: outcome.reviewed.filter((candidate) => candidate.status === 'needs_review').map((candidate) => candidate.id),
+          ms: Date.now() - start,
+        };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/review', role: 'analyst',
+      summary: 'accept, reject, edit, resolve or add a candidate (append-only)', input: ['action', 'target', 'reason', 'patch'],
+      handler: (request, context) => {
+        const action = requireString(request.body, 'action');
+        if (!['accept', 'reject', 'edit', 'resolve-conflict', 'add'].includes(action)) {
+          throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`,
+            'use accept, reject, edit, resolve-conflict or add');
+        }
+        const graph = String(request.body.graph ?? context.options.graph);
+        const log = new ReviewLog(join(context.options.workspace, 'reviews', `${graph}.jsonl`));
+        const revision = log.append({
+          ts: context.options.now(), actor: request.principal.actor, action: action as never,
+          target: String(request.body.target ?? ''), reason: String(request.body.reason ?? ''),
+          ...(request.body.patch === undefined ? {} : { patch: request.body.patch as Record<string, unknown> }),
+        });
+        const outcome = rebuildReport({
+          fixtures: context.options.fixtures, graph, workspace: context.options.workspace, now: context.options.now(),
+        });
+        return { revision, gate: outcome.report.gate, coverage: outcome.report.coverage };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/publish', role: 'owner',
+      summary: 'write the reviewed model into PhoenixGraph and snapshot the revision', input: ['graph'],
+      handler: async (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const outcome = rebuildReport({
+          fixtures: context.options.fixtures, graph, workspace: context.options.workspace, now: context.options.now(),
+        });
+        if (!outcome.report.gate.passed) {
+          throw new HttpError(409, 'gate-refused', 'the gate refused to publish', outcome.report.gate.reasons.join('; '));
+        }
+        const previous = readJson<{ candidates: never[] }>(join(context.options.workspace, 'models', graph,
+          `v${Math.max(1, outcome.modelVersion - 1)}.json`));
+        const client = new GraphClient(context.config.phoenix);
+        const revision = outcome.modelVersion;
+        const result = await publish(client, {
+          graph, candidates: outcome.reviewed, revision,
+          ...(previous?.candidates ? { previousCandidates: previous.candidates as never } : {}),
+        });
+        const snapshot = join(context.options.workspace, 'models', graph, `v${revision}.json`);
+        return { ...result, snapshot, analyticalExport: exportAnalytical(graph, outcome.reviewed, revision) as unknown as null };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/sql/plan', role: 'analyst',
+      summary: 'analyze a statement, propose rewrites, and price both sides', input: ['sql', 'requiredColumns', 'dialect'],
+      handler: (request, context) => {
+        const sql = requireString(request.body, 'sql');
+        const required = Array.isArray(request.body.requiredColumns)
+          ? (request.body.requiredColumns as unknown[]).map(String) : [];
+        return withDatabase(context, (_run, catalog) => {
+          const workspace = new SqlWorkspace(join(context.options.workspace, 'sql'));
+          return workspace.plan(sql, {
+            catalog, dbPath: join(context.options.fixtures, 'data', 'demo.db'),
+            requiredColumns: required, actor: request.principal.actor, now: context.options.now(),
+          });
+        });
+      },
+    },
+    {
+      method: 'GET', path: '/v1/sql/steps/:id', role: 'viewer',
+      summary: 'replay a plan ledger', input: [],
+      handler: (request, context) => new SqlWorkspace(join(context.options.workspace, 'sql')).state(request.params.id!),
+    },
+    {
+      method: 'POST', path: '/v1/sql/steps/:id', role: 'analyst',
+      summary: 'apply, revert or hand-edit a step (a human edit is a ledger entry)', input: ['action', 'step', 'sql', 'note'],
+      handler: (request, context) => {
+        const workspace = new SqlWorkspace(join(context.options.workspace, 'sql'));
+        const id = request.params.id!;
+        const action = requireString(request.body, 'action');
+        const actor = request.principal.actor;
+        if (action === 'apply') {
+          const step = Number(request.body.step ?? 0);
+          const state = workspace.state(id);
+          const target = state.steps.find((entry) => entry.seq === step);
+          if (!target) throw new HttpError(400, 'unknown-step', `plan '${id}' has no step ${step}`);
+          if (target.kind !== 'rewrite') {
+            throw new HttpError(400, 'suggestion-not-appliable',
+              `step ${step} is a suggestion: applying it would change the answer`,
+              'suggestions are for a person to accept by editing the SQL, not for the service to apply');
+          }
+          return workspace.apply(id, step, actor);
+        }
+        if (action === 'revert') return workspace.revert(id, Number(request.body.step ?? 0), actor);
+        if (action === 'edit') {
+          return workspace.edit(id, requireString(request.body, 'sql'), actor, String(request.body.note ?? 'edited over HTTP'));
+        }
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use apply, revert or edit');
+      },
+    },
+    {
+      method: 'GET', path: '/v1/skills', role: 'viewer',
+      summary: 'the skill library, with scores and status', input: ['status', 'agent'],
+      handler: (request, context) => {
+        const store = new SkillStore(join(context.options.workspace, 'skills'));
+        const status = request.query.get('status') ?? undefined;
+        const agent = request.query.get('agent') ?? undefined;
+        return {
+          tips: store.list({
+            ...(status ? { status: status as never } : {}),
+            ...(agent ? { agent: agent as never } : {}),
+          }).map((tip) => ({
+            id: tip.id, statement: tip.statement, status: tip.status, scope: tip.scope,
+            score: SkillStore.score(tip), confirmations: tip.confirmations.length, misses: tip.misses,
+            evidence: tip.evidence.length,
+          })),
+        };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/skills/advise', role: 'viewer',
+      summary: 'which tips apply to a statement, and why', input: ['sql', 'dialect', 'exclude'],
+      handler: (request, context) => {
+        const sql = requireString(request.body, 'sql');
+        const store = new SkillStore(join(context.options.workspace, 'skills'));
+        return withDatabase(context, (_run, catalog) => advise(store, sql, {
+          catalog,
+          ...(typeof request.body.dialect === 'string' ? { dialect: request.body.dialect } : {}),
+          ...(Array.isArray(request.body.exclude) ? { exclude: (request.body.exclude as unknown[]).map(String) } : {}),
+        }));
+      },
+    },
+    {
+      method: 'POST', path: '/v1/skills/decide', role: 'analyst',
+      summary: 'confirm, dispute, promote or retire a tip', input: ['id', 'action', 'note', 'run'],
+      handler: (request, context) => {
+        const store = new SkillStore(join(context.options.workspace, 'skills'));
+        const id = requireString(request.body, 'id');
+        const action = requireString(request.body, 'action');
+        const actor = request.principal.actor;
+        const note = String(request.body.note ?? '');
+        const run = String(request.body.run ?? `${actor}-${context.options.now()}`);
+        if (action === 'confirm') return store.confirm(id, run, actor, note);
+        if (action === 'miss') return store.miss(id, run, actor, note);
+        if (action === 'promote') return store.promote(id, actor, note || 'promoted over HTTP');
+        if (action === 'demote') return store.demote(id, actor, note || 'withdrawn over HTTP');
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use confirm, miss, promote or demote');
+      },
+    },
+    {
+      method: 'GET', path: '/v1/skills/export', role: 'viewer',
+      summary: 'SKILL.md for the library', input: ['status'],
+      handler: (request, context) => {
+        const store = new SkillStore(join(context.options.workspace, 'skills'));
+        const status = request.query.get('status') ?? undefined;
+        const tips = store.list(status ? { status: status as never } : {});
+        return { markdown: toSkillMarkdown(tips, {
+          name: 'phoenixagent-skills', description: 'harvested from real runs',
+          generatedAt: context.options.now(),
+        }) };
+      },
+    },
+    {
+      method: 'GET', path: '/v1/audit/recent', role: 'owner',
+      summary: 'the last N API calls, with actor and status', input: ['limit'],
+      handler: (request, context) => {
+        const limit = Number(request.query.get('limit') ?? 50);
+        const entries = readJsonl<Record<string, unknown>>(context.auditPath);
+        return { entries: entries.slice(-Math.max(1, Math.min(limit, 500))) };
+      },
+    },
+  ];
+}
+
+function describeRoute(route: RouteDef): { name: string; method: string; path: string; role: Role; summary: string; input: string[] } {
+  return {
+    name: `${route.method} ${route.path}`,
+    method: route.method,
+    path: route.path,
+    role: route.role,
+    summary: route.summary,
+    input: route.input,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------
+// handlers with the confirm gate
+
+async function confirmable(request: Request, scope: string, plan: Record<string, unknown>,
+  execute: (plan: Record<string, unknown>, context: Context, actor: string) => Promise<unknown> | unknown,
+  context: Context): Promise<unknown> {
+  const token = request.body.confirmToken;
+  if (typeof token === 'string' && token.length > 0) {
+    context.tokens.verify(token, plan, scope);
+    return execute(plan, context, request.principal.actor);
+  }
+  if (request.body.mode === 'confirm') {
+    const issued = context.tokens.issue(plan, scope, Date.parse(context.options.now()));
+    return { mode: 'confirm', scope, plan, ...issued, note: 'nothing ran; send the same plan with confirmToken' };
+  }
+  return execute(plan, context, request.principal.actor);
+}
+
+function executeAttribute(plan: Record<string, unknown>, context: Context): unknown {
+  return withDatabase(context, (run) => {
+    const { index } = loadModel(context);
+    return attribute({
+      metric: String(plan.metric), from: String(plan.from), to: String(plan.to),
+      maxDepth: Number(plan.depth ?? 2), index, run,
+    });
+  });
+}
+
+function executeCampaign(plan: Record<string, unknown>, context: Context): unknown {
+  return withDatabase(context, (run) => {
+    const { index } = loadModel(context);
+    return campaign({
+      run, index,
+      ...(plan.budget === undefined || plan.budget === null ? {} : { budget: Number(plan.budget) }),
+      ...(plan.maxChangePct === undefined || plan.maxChangePct === null ? {} : { maxChangePct: Number(plan.maxChangePct) }),
+    });
+  });
+}
+
+function executeRisk(context: Context, options: Record<string, unknown>): unknown {
+  return withDatabase(context, (run) => riskAgent({
+    run, graph: context.options.graph, workspace: context.options.workspace,
+    ...(options.holdoutMonths === undefined ? {} : { holdoutMonths: Number(options.holdoutMonths) }),
+  }));
+}
+
+async function askHandler(request: Request, context: Context): Promise<unknown> {
+  const question = requireString(request.body, 'question');
+  const decision = route(question);
+  if (decision.agent === null) {
+    return { mode: 'clarify', decision, note: 'the router refused to pick: ask the user which agent they meant' };
+  }
+  switch (decision.agent) {
+    case 'semantic': {
+      const { report } = loadModel(context);
+      return { agent: 'semantic', decision, report, note: 'a build/report question, not an answer' };
+    }
+    case 'attribution': {
+      const metric = String(request.body.metric ?? decision.signature.metrics[0] ?? 'spend');
+      const from = String(request.body.from ?? '2025-10');
+      const to = String(request.body.to ?? '2025-11');
+      return confirmable(request, 'attribute', { metric, from, to, depth: 2 }, executeAttribute, context);
+    }
+    case 'campaign':
+      return confirmable(request, 'campaign', { budget: null, maxChangePct: null }, executeCampaign, context);
+    case 'risk':
+      return executeRisk(context, {});
+    case 'ask':
+    default: {
+      // the base answers factual questions from its own semantic layer; this service does not re-implement it
+      const client = new GraphClient(context.config.phoenix);
+      const answer = await client.callTool('ask_data', {
+        graph: 'tpc-h-analytics', question, mode: request.body.mode === 'confirm' ? 'auto' : 'auto',
+      });
+      return { agent: 'ask', decision, answer };
+    }
+  }
+}

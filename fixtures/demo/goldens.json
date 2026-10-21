@@ -1,0 +1,21 @@
+{
+  "note": "Computed from the seed rows in JavaScript (see scripts/build-demo-db.mjs), independent of any SQL or metric definition.",
+  "generatedAt": "2026-10-20T09:41:02.339Z",
+  "rowCounts": {
+    "fact_ad_daily": 864,
+    "fact_order": 2600
+  },
+  "metrics": {
+    "spend": 67726359.95,
+    "revenue": 125879621.5,
+    "impressions": 2166321402,
+    "clicks": 29917079,
+    "conversions": 309411,
+    "new_customers": 107394,
+    "gmv": 1997859.02,
+    "paid_orders": 2140,
+    "roi": 1.85865,
+    "cpa": 218.888016,
+    "conversion_rate": 0.01034229
+  }
+}

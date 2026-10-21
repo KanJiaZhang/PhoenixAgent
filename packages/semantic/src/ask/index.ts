@@ -1,0 +1,12 @@
+/**
+ * M2.5: the semantic layer's own query surface - interpret, translate, ask - deterministic over the model.
+ *
+ * It exists because a semantic layer that cannot answer a question is a document. The interpreter uses the
+ * model's vocabulary (never a model in the LLM sense), `translate` renders and checks, `ask` executes and
+ * carries the provenance: model revision, metric definition, the SQL that ran, the rows and the limits.
+ */
+
+export { interpret, requestedGrain } from './interpret.ts';
+export type { QuerySpec, Interpretation, PeriodSpec, PeriodGrain } from './interpret.ts';
+export { translate, ask } from './query.ts';
+export type { TranslateRequest, TranslateResult, SemanticPlan, AskResult } from './query.ts';

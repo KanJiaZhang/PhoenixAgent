@@ -1,0 +1,20 @@
+{
+  "id": "risk-rule-audit",
+  "name": "风控策略巡检 Agent",
+  "domain": "risk",
+  "version": "1.0",
+  "question": "现有风控规则还值得留着吗？哪些在重复拦截、哪些该重拟合、哪些该下线？下线会少抓多少？",
+  "routes": { "type": "detective", "agent": "risk", "signals": ["规则", "风控", "下线", "重复", "巡检"] },
+  "model": { "graph": "demo-analytics", "rules": "risk_rule（status=active）", "labels": "risk_event.is_fraud + label_date" },
+  "tools": ["risk.audit", "risk.approvals"],
+  "gates": {
+    "holdoutMonths": 6,
+    "minPrecision": 0.5,
+    "driftThreshold": 0.25,
+    "retireRequiresHuman": true,
+    "noMutation": true
+  },
+  "budget": { "maxQueries": 20 },
+  "skills": { "scopes": ["risk"], "harvest": true },
+  "outputs": ["audit.json", "recommendation.md", "skills.json"]
+}
