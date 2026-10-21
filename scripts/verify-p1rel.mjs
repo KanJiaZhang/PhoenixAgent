@@ -59,10 +59,10 @@ const auth = {
 const server = createAgentServer({ port: 0, workspace, fixtures, graph, auth, confirmSecret: 'rel-secret', now: () => now });
 const base = await server.listen();
 const KEY = { owner: 'owner-key', analyst: 'analyst-key', viewer: 'viewer-key' };
-async function http(method, path, body, role = 'viewer') {
+async function http(method, path, body, role = 'viewer', extraHeaders = {}) {
   const response = await fetch(`${base}${path}`, {
     method,
-    headers: { 'content-type': 'application/json', 'x-api-key': KEY[role] ?? role },
+    headers: { 'content-type': 'application/json', 'x-api-key': KEY[role] ?? role, ...extraHeaders },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await response.text();
@@ -186,7 +186,40 @@ try {
     && /consecutive canary errors/.test(afterThree.config.rollback.reason), afterThree.config.rollback.reason);
   checkEqual('and the actor is the guard, not a person', afterThree.config.rollback.actor, 'canary-guard');
 
-  section('7. replaying a release decision is not a way around the gate');
+  section('7. a scoped release only reaches its groups');
+  const scoped = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 2, canaryPct: 100, scope: { groups: ['beta'] },
+  }, 'owner');
+  checkEqual('the scope is stored with the release', scoped.body.scope?.groups?.[0], 'beta');
+  const outsider = await http('POST', '/v1/semantic/ask', { question }, 'canary-key');
+  check('an actor outside the scope gets the stable revision even at 100%',
+    outsider.body.plan.modelRevision === null || outsider.body.plan.modelRevision === 1, `${outsider.body.plan.modelRevision}`);
+  const insider = await http('POST', '/v1/semantic/ask', { question }, 'canary-key', { 'x-pagent-group': 'beta' });
+  checkEqual('a member of the group gets the canary', insider.body.plan.modelRevision, 2);
+  checkEqual('pickRevision agrees, out of scope', pickRevision(scoped.body, 'anyone', 'q', 'alpha').side, 'out-of-scope');
+  await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'scope test done' }, 'owner');
+
+  section('8. a canary whose number moves is a failure, not just a slow release');
+  const guarded = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 2, canaryPct: 100, qualityGuard: { maxRelativeDelta: 0.02 },
+  }, 'owner');
+  check('the guard is stored with the release', guarded.body.qualityGuard?.maxRelativeDelta === 0.02,
+    JSON.stringify(guarded.body.qualityGuard));
+  const firstGuarded = await http('POST', '/v1/semantic/ask', { question }, 'canary-key');
+  check('the first canary answer is still returned to the caller', firstGuarded.status === 200 && firstGuarded.body.plan.modelRevision === 2,
+    `${firstGuarded.status}/${firstGuarded.body.plan?.modelRevision}`);
+  const afterFirst = (await http('GET', '/v1/semantic/release')).body;
+  check('but it is recorded as a quality failure, not an answer', afterFirst.evidence.errors === 1 && afterFirst.evidence.answers === 0,
+    `${afterFirst.evidence.answers} answers / ${afterFirst.evidence.errors} errors`);
+  check('the failure names the movement and the limit', /quality: total moved/.test(afterFirst.events.at(-1).detail)
+    && /limit 2\.00%/.test(afterFirst.events.at(-1).detail), afterFirst.events.at(-1).detail);
+  await http('POST', '/v1/semantic/ask', { question }, 'stable-key');
+  await http('POST', '/v1/semantic/ask', { question }, 'viewer-key');
+  const afterQuality = (await http('GET', '/v1/semantic/release')).body;
+  checkEqual('three of them stop the release', afterQuality.config.status, 'rolled-back');
+  check('and the reason is the guard\'s', /consecutive canary errors/.test(afterQuality.config.rollback.reason), afterQuality.config.rollback.reason);
+
+  section('9. replaying a release decision is not a way around the gate');
   const store = new ReleaseStore(workspace, graph);
   checkEqual('the store reads back what the API wrote', store.get().status, 'rolled-back');
   check('and the auto rollback is in the event log', store.events().some((event) => event.kind === 'rollback' && event.actor === 'canary-guard'));

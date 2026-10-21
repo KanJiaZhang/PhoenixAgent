@@ -175,6 +175,43 @@ document.querySelectorAll('[data-act]').forEach((button) => {
         '<table><thead><tr><th>规则</th><th>命中</th><th>精确率</th><th>独占正例</th><th>判定</th><th>理由</th></tr></thead><tbody>' + rows + '</tbody></table>';
       return;
     }
+    if (action === 'rel-start') {
+      return show(releaseOut2, await api('POST', '/v1/semantic/release', {
+        action: 'start',
+        from: Number(document.getElementById('rel-from').value),
+        to: Number(document.getElementById('rel-to').value),
+        canaryPct: Number(document.getElementById('rel-pct').value),
+      }));
+    }
+    if (action === 'rel-status') {
+      const result = await api('GET', '/v1/semantic/release');
+      if (!result.ok) return show(releaseOut2, result);
+      return show(releaseOut2, {
+        config: result.body.config, evidence: result.body.evidence,
+        events: result.body.events.slice(-8),
+      });
+    }
+    if (action === 'rel-promote') {
+      const question = document.getElementById('release-question').value;
+      return show(releaseOut2, await api('POST', '/v1/semantic/release', { action: 'promote', question }));
+    }
+    if (action === 'rel-rollback') {
+      const reason = prompt('回滚理由（会写进事件日志）', '数字与稳定版不一致');
+      if (!reason) return show(releaseOut2, { note: '回滚需要理由，已取消' });
+      return show(releaseOut2, await api('POST', '/v1/semantic/release', { action: 'rollback', reason }));
+    }
+    if (action === 'release-drafts') {
+      const result = await api('GET', '/v1/semantic/lexicon/drafts?status=pending');
+      if (!result.ok) return show(releaseOut2, result);
+      const rows = result.body.drafts.map((draft) => '<tr><td><code>' + escapeHtml(draft.word) + '</code></td>' +
+        '<td>' + escapeHtml(draft.target) + '</td><td class="muted">' + escapeHtml(draft.question) + '</td>' +
+        '<td>' + escapeHtml(draft.proposedBy) + '</td><td>' + escapeHtml(draft.status) + '</td></tr>').join('');
+      releaseOut2.innerHTML = '<div class="muted">提案人不能认证自己的词：用第二个 analyst 的 key 调 ' +
+        'POST /v1/semantic/lexicon/drafts/:id {action:"accept"}。</div>' +
+        (rows ? '<table><thead><tr><th>词</th><th>目标</th><th>来自哪个问题</th><th>提案人</th><th>状态</th></tr></thead><tbody>' + rows + '</tbody></table>'
+          : '<div class="muted">没有待认证的词。</div>');
+      return;
+    }
     if (action === 'release-capacity') {
       const result = await api('POST', '/v1/risk/capacity', {
         hitsPerDay: Number(document.getElementById('cap-hits').value),

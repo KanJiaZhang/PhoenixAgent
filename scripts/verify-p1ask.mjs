@@ -19,7 +19,7 @@ import { sqliteRunner } from '../packages/dataplane/src/sqlite.ts';
 import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { build } from '../packages/semantic/src/pipeline.ts';
 import { indexModel } from '../packages/semantic/src/sql.ts';
-import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt } from '../packages/semantic/src/ask/index.ts';
+import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion } from '../packages/semantic/src/ask/index.ts';
 
 const root = process.cwd();
 const workspace = join(root, '.pag-p1ask');
@@ -153,7 +153,83 @@ checkEqual('the session remembers three turns', session.turns.length, 3);
 const noContext = await new AskSession({ index, run, workspace, graph, now }).followUp('那按月呢');
 check('a follow-up with no previous turn is refused, not answered', noContext.spec === null, noContext.refusals.map((refusal) => refusal.code).join(','));
 
-section('8. determinism');
+section('8. new vocabulary goes through a queue, not a side effect');
+const queue = new DraftQueue(workspace, graph);
+const proposal = queue.propose({
+  word: '客单价', target: 'metric/cpa', question: '2025 年 11 月各大区客单价', index,
+  source: 'manual', proposedBy: 'bob', now: now.toISOString(),
+});
+check('a proposal becomes a pending draft', proposal.status === 'pending' && queue.pending().length === 1, proposal.id);
+check('and it is not in the lexicon yet', loadLexicon(workspace, graph).every((entry) => entry.word !== '客单价'));
+const stillUnknown = await askHybrid({ question: '2025 年 11 月各大区客单价', index, run, workspace, graph, now });
+checkEqual('so the word still does not answer', stillUnknown.spec, null);
+
+let selfReview = null;
+try {
+  queue.decide(proposal.id, { action: 'accept', actor: 'bob', index, now: now.toISOString() });
+} catch (error) {
+  selfReview = error;
+}
+check('the proposer cannot certify their own word', selfReview !== null, selfReview?.message ?? '');
+
+const certified = queue.decide(proposal.id, { action: 'accept', actor: 'carol', index, now: now.toISOString() });
+checkEqual('a second analyst certifies it into the lexicon', certified.entry?.target, 'metric/cpa');
+check('and the draft records who reviewed it', certified.draft.reviewed.by === 'carol' && certified.draft.status === 'accepted',
+  `${certified.draft.reviewed.by}/${certified.draft.status}`);
+const nowKnown = await askHybrid({ question: '2025 年 11 月各大区客单价', index, run, workspace, graph, now });
+checkEqual('and the next question resolves it', nowKnown.spec?.metric, 'metric/cpa');
+
+let draftBadTarget = null;
+try {
+  queue.propose({ word: '净利', target: 'metric/profit', question: '2025 年 11 月各大区净利', index, proposedBy: 'bob' });
+} catch (error) {
+  draftBadTarget = error;
+}
+check('a target the model does not have is refused at proposal time', draftBadTarget !== null, draftBadTarget?.message ?? '');
+let unquoted = null;
+try {
+  queue.propose({ word: '毛利', target: 'metric/gmv', question: '2025 年 11 月各大区花费', index, proposedBy: 'bob' });
+} catch (error) {
+  unquoted = error;
+}
+check('a word the user never wrote is refused', unquoted !== null && /does not appear/.test(unquoted.message), unquoted?.message ?? '');
+
+const rejectedDraft = queue.propose({
+  word: '整体花费', target: 'metric/spend', question: '2025 年 11 月整体花费', index, proposedBy: 'bob', now: now.toISOString(),
+});
+const rejected = queue.decide(rejectedDraft.id, { action: 'reject', actor: 'carol', reason: '已经能被「花费」命中', index, now: now.toISOString() });
+checkEqual('a rejection records its reason', rejected.draft.reviewed.reason, '已经能被「花费」命中');
+checkEqual('and stops being pending', queue.pending().length, 0);
+check('the lexicon is unchanged by the rejection', loadLexicon(workspace, graph).every((entry) => entry.word !== '整体花费'));
+
+section('9. a model may propose, and only a person may certify');
+const proposingGateway = {
+  enabled: true, model: 'fake-model',
+  async completeJson() {
+    return [
+      { word: '曝光成本', target: 'cpa' },
+      { word: '伪指标', target: 'metric/does-not-exist' },
+      { word: '用户', target: 'revenue' },
+    ];
+  },
+};
+const fromModel = await proposeFromQuestion({
+  question: '2025 年 11 月各大区曝光成本与伪指标', index, gateway: proposingGateway,
+  actor: 'bob', workspace, graph, now: now.toISOString(),
+});
+check('the valid candidate becomes a draft', fromModel.drafts.length === 1 && fromModel.drafts[0].word === '曝光成本',
+  JSON.stringify(fromModel.drafts.map((draft) => draft.word)));
+check('the invented target is dropped, with its reason', fromModel.dropped.some((entry) => entry.word === '伪指标' && /no 'metric\/does-not-exist'/.test(entry.reason)),
+  JSON.stringify(fromModel.dropped.map((entry) => entry.reason).slice(0, 2)));
+check('a word the question does not contain is dropped too', fromModel.dropped.some((entry) => entry.word === '用户'),
+  JSON.stringify(fromModel.dropped.map((entry) => entry.word)));
+check('the draft carries the model that proposed it', fromModel.drafts[0].source === 'llm' && fromModel.drafts[0].model === 'fake-model',
+  `${fromModel.drafts[0].source}/${fromModel.drafts[0].model}`);
+const stillPending = queue.pending();
+check('and it is still pending: the model proposed, nobody certified', stillPending.length === 1 && stillPending[0].status === 'pending',
+  stillPending.map((draft) => draft.word).join(','));
+
+section('10. determinism');
 const again = await askHybrid({ question: '2025 年 11 月各大区毛利', index, run, workspace, graph, now });
 check('the same question gives the same SQL', again.plan?.sql[0] === afterLearning.plan?.sql[0], 'identical statements');
 

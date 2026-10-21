@@ -21,7 +21,7 @@ import { check, checkClose, checkEqual, section, summary } from './verify-lib.mj
 import { sqliteRunner } from '../packages/dataplane/src/sqlite.ts';
 import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { graphFeaturesReport } from '../packages/agents/risk/src/graph-report.ts';
-import { buildSnapshot, snapshotCutoff, publishAndCrossCheck, cleanupPublishedSchema } from '../packages/agents/risk/src/graph.ts';
+import { buildSnapshot, buildSnapshots, isoWeek, periodOf, snapshotCutoff, publishAndCrossCheck, cleanupPublishedSchema } from '../packages/agents/risk/src/graph.ts';
 import { evaluateFeature } from '../packages/agents/risk/src/features.ts';
 import { loadConfig } from '../packages/core/src/config.ts';
 import { GraphClient } from '../packages/core/src/graph-client.ts';
@@ -149,6 +149,44 @@ check('and the graph block weights point the right way (bigger component, more r
   report.models.coefficients.find((entry) => entry.name === 'g_component_size').weight > 0,
   report.models.coefficients.map((entry) => `${entry.name}=${entry.weight}`).join(' '));
 
+section('weekly snapshots: the same rule at a finer grain');
+check('a week key is ISO-8601, not the calendar week', isoWeek('2024-12-30').key === '2025-W01' && isoWeek('2025-01-06').key === '2025-W02',
+  `${isoWeek('2024-12-30').key} / ${isoWeek('2025-01-06').key}`);
+check('the weekly cutoff is the day before the week starts', periodOf('2024-03-06', 'week').asOf === '2024-03-03',
+  `${periodOf('2024-03-06', 'week').asOf} for week starting ${isoWeek('2024-03-06').start}`);
+check('the demo year spans 104 ISO weeks', new Set(links.map((link) => isoWeek(link.date).key)).size >= 100,
+  `${new Set(links.map((link) => isoWeek(link.date).key)).size} weeks`);
+// a quarter of the data keeps this fast: 13 snapshots are enough to check the rule, the grain and the freshness
+const quarter = links.filter((link) => link.date >= '2025-01-01' && link.date < '2025-04-01');
+const weekSnapshots = buildSnapshots(quarter, 'week');
+check('a snapshot per week of the quarter', weekSnapshots.size === 13, `${weekSnapshots.size} snapshots`);
+const weeklyViolations = [...weekSnapshots.entries()].filter(([key, snapshot]) => {
+  const weekStart = isoWeek(quarter.find((link) => isoWeek(link.date).key === key).date).start;
+  return snapshot.asOf >= weekStart;
+});
+check('no weekly snapshot is newer than the week it serves', weeklyViolations.length === 0, `${weeklyViolations.length} violations`);
+const probe = quarter[Math.floor(quarter.length * 0.9)];
+const monthlyQuarter = buildSnapshots(quarter, 'month');
+const monthlyAtProbe = monthlyQuarter.get(probe.date.slice(0, 7));
+const weeklyAtProbe = weekSnapshots.get(isoWeek(probe.date).key);
+check('the weekly snapshot knows more than the monthly one for a mid-month event', weeklyAtProbe.edges > monthlyAtProbe.edges,
+  `${weeklyAtProbe.edges} vs ${monthlyAtProbe.edges} edges`);
+check('and each weekly snapshot keeps its own cutoff', [...weekSnapshots.values()].every((snapshot) => snapshot.asOf < snapshot.serves.slice(0, 4) + '-12-31'),
+  'cutoffs are dates, not labels');
+
+if (process.env.PAGENT_GRAPH_WEEKLY === '1') {
+  // the full run at the finer grain: 104 snapshots, ~18s. Opt-in, like the base cross-check.
+  const weeklyReport = await graphFeaturesReport({ run, cutoff: '2025-07', grain: 'week' });
+  check('the weekly report uses weekly periods', weeklyReport.snapshot.grain === 'week' && weeklyReport.snapshot.periods >= 100,
+    `${weeklyReport.snapshot.periods} periods`);
+  check('and its point-in-time gate still passes', weeklyReport.features.every((feature) => feature.pointInTime.ok),
+    weeklyReport.features.map((feature) => feature.pointInTime.violations).join(','));
+  check('the increment survives the finer grain', Math.abs(weeklyReport.models.increment - report.models.increment) < 0.01,
+    `month ${report.models.increment} vs week ${weeklyReport.models.increment}`);
+} else {
+  console.log('  skip  set PAGENT_GRAPH_WEEKLY=1 to run the full 104-week report (about 18s)');
+}
+
 section('determinism: a second run produces identical numbers');
 const again = await graphFeaturesReport({ run, cutoff: '2025-07' });
 checkEqual('same feature AUCs', JSON.stringify(again.features.map((feature) => feature.auc)), JSON.stringify(report.features.map((feature) => feature.auc)));
@@ -171,7 +209,7 @@ if (process.env.PAGENT_GRAPH_CROSSCHECK === '1') {
 }
 
 section('cost');
-console.log(`  ${report.cost.events} events, ${report.snapshot.months} snapshots, ${report.cost.accounts} accounts, ${report.cost.ms} ms, ${report.cost.queries} queries`);
+console.log(`  ${report.cost.events} events, ${report.snapshot.periods} ${report.snapshot.grain} snapshots, ${report.cost.accounts} accounts, ${report.cost.ms} ms, ${report.cost.queries} queries`);
 console.log(`  features: ${report.features.map((feature) => `${feature.name} AUC=${feature.auc} IV=${feature.iv}`).join(' | ')}`);
 console.log(`  model: base ${report.models.base.auc} -> +graph ${report.models.withGraph.auc} (increment ${report.models.increment})`);
 

@@ -106,6 +106,7 @@
       <input id="cap-people" value="6" size="4" title="审核人数">
       <button data-act="release-capacity">审核容量</button>
       <button data-act="release-graph">图特征</button>
+      <button data-act="release-drafts">词表草案</button>
     </div>
 
     <div class="row">
@@ -115,6 +116,16 @@
       <button data-act="hybrid-follow">跟进</button>
     </div>
 
+    <div class="row">
+      <input id="rel-from" value="1" size="3" title="从哪个版本">
+      <span class="muted">→</span>
+      <input id="rel-to" value="2" size="3" title="到哪个版本">
+      <input id="rel-pct" value="10" size="3" title="灰度比例 %">
+      <button class="primary" data-act="rel-start">开灰度</button>
+      <button data-act="rel-status">灰度状态</button>
+      <button data-act="rel-promote">晋升</button>
+      <button class="danger" data-act="rel-rollback">回滚</button>
+    </div>
     <div class="row">
       <input id="wb-budget" value="3000000" size="10" title="预算">
       <button class="primary" data-act="wb-dry">下发（干跑）</button>

@@ -28,6 +28,10 @@ export interface ReleaseConfig {
   startedAt: string;
   startedBy: string;
   probeQuestion?: string;
+  /** When set, only requests carrying one of these groups are eligible for the canary. */
+  scope?: { groups: string[] };
+  /** When set, a canary answer whose total moves further than this against the stable answer is a failure. */
+  qualityGuard?: { maxRelativeDelta: number };
   promote?: { at: string; actor: string; answers: number; errors: number; shadow?: string };
   rollback?: { at: string; actor: string; reason: string; auto: boolean };
 }
@@ -97,7 +101,10 @@ export class ReleaseStore {
     appendFileSync(this.eventsPath, `${JSON.stringify(event)}\n`, 'utf8');
   }
 
-  start(options: { from: number; to: number; canaryPct: number; actor: string; now?: string; probeQuestion?: string }): ReleaseConfig {
+  start(options: {
+    from: number; to: number; canaryPct: number; actor: string; now?: string; probeQuestion?: string;
+    scope?: { groups: string[] }; qualityGuard?: { maxRelativeDelta: number };
+  }): ReleaseConfig {
     const existing = this.get();
     if (existing?.status === 'running') {
       throw new Error(`a release is already running for '${this.graph}' (v${existing.fromRevision} -> v${existing.toRevision}, ${existing.canaryPct}%)`);
@@ -115,6 +122,8 @@ export class ReleaseStore {
       startedAt: options.now ?? new Date().toISOString(),
       startedBy: options.actor,
       ...(options.probeQuestion ? { probeQuestion: options.probeQuestion } : {}),
+      ...(options.scope?.groups.length ? { scope: { groups: options.scope.groups } } : {}),
+      ...(options.qualityGuard ? { qualityGuard: options.qualityGuard } : {}),
     };
     this.write(config);
     this.log({ ts: config.startedAt, graph: this.graph, kind: 'start', revision: config.toRevision, side: 'canary', actor: options.actor, detail: `${config.canaryPct}%` });
@@ -245,15 +254,19 @@ export function bucketOf(actor: string, question: string): number {
  * A promoted release serves the new revision to everyone; a rolled-back one serves nobody; a running one uses the
  * bucket. There is no "random" branch, which is what makes a canary reproducible from the request alone.
  */
-export function pickRevision(config: ReleaseConfig | null, actor: string, question: string): {
+export function pickRevision(config: ReleaseConfig | null, actor: string, question: string, group?: string): {
   revision: 'stable' | 'canary';
   bucket: number;
-  side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none';
+  side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none' | 'out-of-scope';
 } {
   if (!config) return { revision: 'stable', bucket: -1, side: 'none' };
   const bucket = bucketOf(actor, question);
   if (config.status === 'promoted') return { revision: 'canary', bucket, side: 'promoted' };
   if (config.status === 'rolled-back') return { revision: 'stable', bucket, side: 'rolled-back' };
+  // a scoped release excludes everyone outside it before the bucket is even consulted
+  if (config.scope?.groups.length && !(group && config.scope.groups.includes(group))) {
+    return { revision: 'stable', bucket, side: 'out-of-scope' };
+  }
   return bucket < config.canaryPct
     ? { revision: 'canary', bucket, side: 'canary' }
     : { revision: 'stable', bucket, side: 'stable' };

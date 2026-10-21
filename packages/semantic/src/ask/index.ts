@@ -13,3 +13,5 @@ export type { TranslateRequest, TranslateResult, SemanticPlan, AskResult } from 
 
 export { askHybrid, validateProposal, buildPrompt, applyLexicon, learnWord, loadLexicon, lexiconPath, AskSession } from './hybrid.ts';
 export type { HybridAsk, HybridAskOptions, Proposal, ProposalGateway, Repair, LexiconEntry, Turn } from './hybrid.ts';
+export { DraftQueue, proposeFromQuestion } from './drafts.ts';
+export type { Draft, ProposeInput } from './drafts.ts';

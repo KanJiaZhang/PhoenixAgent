@@ -65,11 +65,48 @@ export interface GraphSnapshot {
   links: EntityLink[];
 }
 
+export type SnapshotGrain = 'month' | 'week';
+
 /** The last day of the month before `date`: the newest information a decision on `date` may use. */
 export function snapshotCutoff(date: string): string {
   const [year, month] = date.slice(0, 7).split('-').map(Number) as [number, number];
   const previous = new Date(Date.UTC(year, month - 1, 0)); // day 0 of this month = last day of the previous one
   return previous.toISOString().slice(0, 10);
+}
+
+/** ISO-8601 week: Monday-based, week 1 is the week holding the first Thursday. */
+export function isoWeek(date: string): { year: number; week: number; key: string; start: string } {
+  const [year, month, day] = date.slice(0, 10).split('-').map(Number) as [number, number, number];
+  const at = new Date(Date.UTC(year, month - 1, day));
+  const offset = (at.getUTCDay() + 6) % 7; // 0 = Monday
+  const monday = new Date(at);
+  monday.setUTCDate(at.getUTCDate() - offset);
+  const thursday = new Date(monday);
+  thursday.setUTCDate(monday.getUTCDate() + 3);
+  const weekYear = thursday.getUTCFullYear();
+  const firstThursday = new Date(Date.UTC(weekYear, 0, 4));
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - ((firstThursday.getUTCDay() + 6) % 7) + 3);
+  const week = 1 + Math.round((thursday.getTime() - firstThursday.getTime()) / (7 * 86_400_000));
+  return { year: weekYear, week, key: `${weekYear}-W${String(week).padStart(2, '0')}`, start: monday.toISOString().slice(0, 10) };
+}
+
+/**
+ * The period a decision on `date` may use, at the requested grain.
+ *
+ * Monthly is the default because a month of structure is what the audit trail is written against. Weekly is the finer
+ * option: the same snapshot rule ("end before the period begins"), four times the snapshots, and a fresher graph for
+ * accounts that appear mid-month. Both are point-in-time by construction; neither is "the latest data", which is the
+ * mistake this whole module is built to avoid.
+ */
+export function periodOf(date: string, grain: SnapshotGrain): { key: string; asOf: string } {
+  if (grain === 'month') {
+    const month = date.slice(0, 7);
+    return { key: month, asOf: snapshotCutoff(`${month}-01`) };
+  }
+  const week = isoWeek(date);
+  const start = new Date(`${week.start}T00:00:00Z`);
+  start.setUTCDate(start.getUTCDate() - 1); // the day before the week starts
+  return { key: week.key, asOf: start.toISOString().slice(0, 10) };
 }
 
 /** Builds one snapshot from the links known by `asOf` (inclusive). */
@@ -159,12 +196,19 @@ export function buildSnapshot(links: EntityLink[], asOf: string, serves: string)
   };
 }
 
-/** One snapshot per month in the data, each built only from links dated before that month. */
-export function buildSnapshots(links: EntityLink[]): Map<string, GraphSnapshot> {
-  const months = [...new Set(links.map((link) => link.date.slice(0, 7)))].sort();
+/**
+ * One snapshot per period in the data, each built only from links dated before that period begins.
+ *
+ * The map is keyed by the period label (`2024-03` or `2024-W10`), so a lookup is exactly "which snapshot was this
+ * event entitled to".
+ */
+export function buildSnapshots(links: EntityLink[], grain: SnapshotGrain = 'month'): Map<string, GraphSnapshot> {
+  const keys = new Map<string, { key: string; asOf: string }>();
+  for (const link of links) keys.set(periodOf(link.date, grain).key, periodOf(link.date, grain));
   const snapshots = new Map<string, GraphSnapshot>();
-  for (const month of months) {
-    snapshots.set(month, buildSnapshot(links, snapshotCutoff(`${month}-01`), month));
+  for (const key of [...keys.keys()].sort()) {
+    // the cutoff was computed from the first date that landed in this period; every date in it shares the same one
+    snapshots.set(key, buildSnapshot(links, keys.get(key)!.asOf, key));
   }
   return snapshots;
 }
@@ -191,18 +235,25 @@ function pagerankOf(
   ];
   if (nodeIds.length === 0) return new Map();
   const rank = new Map<string, number>(nodeIds.map((node) => [node, 1 / nodeIds.length]));
-  const outgoing = (node: string): string[] => {
-    if (node.startsWith('d:')) return [...(deviceAccounts.get(node.slice(2)) ?? [])];
-    if (node.startsWith('i:')) return [...(ipAccounts.get(node.slice(2)) ?? [])];
-    return [...(accountDevices.get(node) ?? [])].map((id) => `d:${id}`)
-      .concat([...(accountIps.get(node) ?? [])].map((id) => `i:${id}`));
-  };
+  // The adjacency is materialised once per snapshot: rebuilding it inside every iteration was the difference between
+  // a weekly run taking 29 seconds and a second or so.
+  const adjacency: { node: string; targets: string[] }[] = [];
+  for (const node of nodeIds) {
+    const targets = node.startsWith('d:')
+      ? [...(deviceAccounts.get(node.slice(2)) ?? [])]
+      : node.startsWith('i:')
+        ? [...(ipAccounts.get(node.slice(2)) ?? [])]
+        : [...(accountDevices.get(node) ?? [])].map((id) => `d:${id}`)
+          .concat([...(accountIps.get(node) ?? [])].map((id) => `i:${id}`));
+    if (targets.length > 0) adjacency.push({ node, targets });
+  }
+  const base = (1 - damping) / nodeIds.length;
+  const next = new Map<string, number>();
   for (let step = 0; step < iterations; step++) {
-    const next = new Map<string, number>(nodeIds.map((node) => [node, (1 - damping) / nodeIds.length]));
-    for (const [node, value] of rank) {
-      const targets = outgoing(node);
-      if (targets.length === 0) continue;
-      const share = (damping * value) / targets.length;
+    next.clear();
+    for (const node of nodeIds) next.set(node, base);
+    for (const { node, targets } of adjacency) {
+      const share = (damping * rank.get(node)!) / targets.length;
       for (const target of targets) next.set(target, (next.get(target) ?? 0) + share);
     }
     for (const [node, value] of next) rank.set(node, value);

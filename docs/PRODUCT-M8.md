@@ -25,6 +25,8 @@ walk 出来。所以
 | 审计 | `GET /v1/audit/recent`（owner） |
 | **P1 发布** | `POST /v1/semantic/{version,shadow}` · `GET|POST /v1/semantic/lexicon` |
 | **P1 决策** | `POST /v1/risk/{conflicts,capacity}` · `POST /v1/campaign/writeback` |
+| **P1 灰度** | `GET\|POST /v1/semantic/release` |
+| **P1 词表队列** | `GET\|POST /v1/semantic/lexicon/drafts` · `POST /v1/semantic/lexicon/drafts/:id` |
 | **P1 图与问数** | `POST /v1/graph/features` · `POST /v1/ask/hybrid` |
 
 `POST /v1/ask` 是需求的第 2 条（按查询结构路由）在产品层的落点：一次提问 → 路由签名 → 选子 agent →
@@ -85,7 +87,7 @@ walk 出来。所以
 
 ## 8. 验收（`npm run verify:m8`，69 条断言）
 
-- 目录 33 条路由（M8 时 24 条，P1 增加 9 条），只读路由逐条 200；未知路由 404（带 `/v1/tools` 提示）；错误方法 405（提示正确方法）。
+- 目录 38 条路由（M8 时 24 条，P1 增加 14 条），只读路由逐条 200；未知路由 404（带 `/v1/tools` 提示）；错误方法 405（提示正确方法）。
 - P1 的 9 条路由由单独的 `verify:p1api`（105 条）验收：角色、确认令牌、审计、Console 调用与库层同一实现。
 - 角色矩阵 7 条断言全过（含"谁要求了什么"的消息内容）。
 - 确认门：令牌验证/换计划/换端点/过期/篡改 5 种情形，各自的错误码；`mode=confirm` 的响应里**没有答案**；

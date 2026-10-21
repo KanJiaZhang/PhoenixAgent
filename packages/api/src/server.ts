@@ -37,7 +37,7 @@ import { campaign } from '../../agents/campaign/src/index.ts';
 import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
 import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
 import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
-import { ask, askHybrid, AskSession, learnWord, loadLexicon, lexiconPath, type Turn } from '../../semantic/src/ask/index.ts';
+import { ask, askHybrid, AskSession, DraftQueue, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
 import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
 import { createGateway } from '../../core/src/llm.ts';
@@ -85,6 +85,8 @@ interface Request {
   params: Record<string, string>;
   body: Record<string, unknown>;
   principal: Principal;
+  /** `x-pagent-group`: a scoped canary release only applies to a member of its groups. */
+  group?: string;
 }
 
 type Handler = (request: Request, context: Context) => Promise<unknown> | unknown;
@@ -188,6 +190,7 @@ async function handle(request: IncomingMessage, response: ServerResponse, contex
     }
     requireRole(principal, match.route.role);
     const body = method === 'POST' ? await readBody(request) : {};
+    const group = headerValue(request.headers['x-pagent-group']);
     const result = await match.route.handler({
       method,
       path: url.pathname,
@@ -195,6 +198,7 @@ async function handle(request: IncomingMessage, response: ServerResponse, contex
       params: match.params,
       body,
       principal,
+      ...(group ? { group } : {}),
     }, context);
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     response.end(JSON.stringify(result));
@@ -489,10 +493,16 @@ function buildRoutes(): RouteDef[] {
             }
           }
           try {
+            const scope = request.body.scope as { groups?: unknown } | undefined;
+            const guard = request.body.qualityGuard as { maxRelativeDelta?: unknown } | undefined;
             return store.start({
               from, to, canaryPct: Number(request.body.canaryPct ?? 10),
               actor: request.principal.actor, now,
               ...(typeof request.body.question === 'string' ? { probeQuestion: request.body.question } : {}),
+              ...(Array.isArray(scope?.groups) ? { scope: { groups: scope.groups.map(String) } } : {}),
+              ...(guard && Number.isFinite(Number(guard.maxRelativeDelta))
+                ? { qualityGuard: { maxRelativeDelta: Number(guard.maxRelativeDelta) } }
+                : {}),
             });
           } catch (error) {
             throw new HttpError(409, 'release-conflict', (error as Error).message);
@@ -816,6 +826,67 @@ function buildRoutes(): RouteDef[] {
       },
     },
     {
+      method: 'GET', path: '/v1/semantic/lexicon/drafts', role: 'viewer',
+      summary: 'words proposed for the vocabulary and not yet certified', input: ['status', 'graph'],
+      handler: (request, context) => {
+        const graph = String(request.query.get('graph') ?? context.options.graph);
+        const queue = new DraftQueue(context.options.workspace, graph);
+        const status = request.query.get('status');
+        return { drafts: status === 'pending' ? queue.pending() : queue.all() };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/lexicon/drafts', role: 'analyst',
+      summary: 'propose a word (explicitly, or by asking a model which words are unknown)', input: ['word', 'target', 'question', 'graph'],
+      handler: async (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { index } = loadModel(context, graph);
+        const queue = new DraftQueue(context.options.workspace, graph);
+        if (typeof request.body.word === 'string' && request.body.word.trim().length > 0) {
+          // the explicit path works with the model switched off: a person proposes, another certifies
+          try {
+            return queue.propose({
+              word: String(request.body.word), target: String(request.body.target ?? ''), question: String(request.body.question ?? ''),
+              index, source: 'manual', model: request.principal.actor, proposedBy: request.principal.actor, now: context.options.now(),
+            });
+          } catch (error) {
+            throw new HttpError(409, 'draft-rejected', (error as Error).message);
+          }
+        }
+        const question = requireString(request.body, 'question');
+        try {
+          return await proposeFromQuestion({
+            question, index, gateway: createGateway(context.config.llm),
+            actor: request.principal.actor, workspace: context.options.workspace, graph, now: context.options.now(),
+          });
+        } catch (error) {
+          throw new HttpError(409, 'llm-unavailable', (error as Error).message,
+            'send {word, target, question} to propose one by hand instead');
+        }
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/lexicon/drafts/:id', role: 'analyst',
+      summary: 'certify or reject a proposed word (the proposer cannot certify their own)', input: ['action', 'reason'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const { index } = loadModel(context, graph);
+        const action = requireString(request.body, 'action');
+        if (action !== 'accept' && action !== 'reject') {
+          throw new HttpError(400, 'bad-parameter', "action must be 'accept' or 'reject'");
+        }
+        try {
+          return new DraftQueue(context.options.workspace, graph).decide(request.params.id!, {
+            action, actor: request.principal.actor, index,
+            ...(typeof request.body.reason === 'string' ? { reason: request.body.reason } : {}),
+            now: context.options.now(),
+          });
+        } catch (error) {
+          throw new HttpError(409, 'draft-decision-refused', (error as Error).message);
+        }
+      },
+    },
+    {
       method: 'POST', path: '/v1/ask/hybrid', role: 'viewer',
       summary: 'ask with an optional model proposal, validated deterministically; followUp continues a session',
       input: ['question', 'sessionId', 'followUp', 'graph'],
@@ -839,7 +910,7 @@ function buildRoutes(): RouteDef[] {
           });
         }
         const sessionsBefore = sessions.size;
-        const routing = canaryRoute(context, graph, request.principal.actor, question);
+        const routing = canaryRoute(context, graph, request.principal.actor, question, request.group);
         const result = await withDatabaseAsync(context, async (run) => {
           const session = new AskSession({
             index: routing.index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()),
@@ -868,16 +939,17 @@ function buildRoutes(): RouteDef[] {
     {
       method: 'POST', path: '/v1/graph/features', role: 'viewer',
       summary: 'structural graph features, their AUC, and the held-out increment over the row features',
-      input: ['cutoff', 'crossCheck'],
+      input: ['cutoff', 'grain', 'crossCheck'],
       handler: async (request, context) => {
         const cutoff = typeof request.body.cutoff === 'string' ? request.body.cutoff : '2025-07';
+        const grain = request.body.grain === 'week' ? 'week' as const : 'month' as const;
         const crossCheck = request.body.crossCheck === true;
         if (crossCheck && request.principal.role !== 'owner') {
           // publishing the snapshot writes into PhoenixGraph: that is an owner action, not a read
           throw new Forbidden('crossCheck publishes a graph into PhoenixGraph and needs the owner role');
         }
         const client = crossCheck ? new GraphClient(context.config.phoenix) : undefined;
-        return withDatabaseAsync(context, (run) => graphFeaturesReport({ run, cutoff, ...(client ? { client, crossCheck } : {}) }));
+        return withDatabaseAsync(context, (run) => graphFeaturesReport({ run, cutoff, grain, ...(client ? { client, crossCheck } : {}) }));
       },
     },
     {
@@ -1058,16 +1130,21 @@ function executeRisk(context: Context, options: Record<string, unknown>): unknow
  * A running release splits traffic by a sticky bucket; the canary side loads the snapshot of `toRevision`. Everything
  * else - no release, a rolled-back one - is the current build, which is also what `modelRevision` reports.
  */
-function canaryRoute(context: Context, graph: string, actor: string, question: string): {
+function canaryRoute(context: Context, graph: string, actor: string, question: string, group?: string): {
   index: ModelIndex;
+  stableIndex: ModelIndex;
   revision: number | null;
-  side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none';
+  side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none' | 'out-of-scope';
   store?: ReleaseStore;
+  qualityGuard?: { maxRelativeDelta: number };
 } {
   const store = new ReleaseStore(context.options.workspace, graph);
   const config = store.get();
-  const picked = pickRevision(config, actor, question);
-  if (picked.revision === 'stable' || !config) return { index: loadModel(context, graph).index, revision: null, side: picked.side };
+  const picked = pickRevision(config, actor, question, group);
+  const stableIndex = loadModel(context, graph).index;
+  if (picked.revision === 'stable' || !config) {
+    return { index: stableIndex, stableIndex, revision: null, side: picked.side };
+  }
   const snapshot = readJson<{ candidates: MergedCandidate[] }>(join(context.options.workspace, 'models', graph, `v${config.toRevision}.json`));
   if (!snapshot?.candidates) {
     // a release whose snapshot disappeared is a broken release: say so instead of quietly serving the stable side
@@ -1075,7 +1152,10 @@ function canaryRoute(context: Context, graph: string, actor: string, question: s
       `the canary points at v${config.toRevision}, but that snapshot is gone`,
       'roll the release back: POST /v1/semantic/release {action:"rollback", reason:"..."}');
   }
-  return { index: indexModel(snapshot.candidates), revision: config.toRevision, side: picked.side, store };
+  return {
+    index: indexModel(snapshot.candidates), stableIndex, revision: config.toRevision,
+    side: picked.side, store, ...(config.qualityGuard ? { qualityGuard: config.qualityGuard } : {}),
+  };
 }
 
 /** Records the outcome of a canary request and rolls back automatically after repeated failures. */
@@ -1086,12 +1166,39 @@ function canaryFailure(context: Context, route: { side: string; revision: number
   return error;
 }
 
+/** The number a quality guard compares: the answer's total, from either the semantic or the hybrid result shape. */
+function totalOf(result: unknown): number | null {
+  const shaped = result as { answer?: { total?: unknown; answer?: { total?: unknown } } } | null;
+  const direct = shaped?.answer?.total;
+  if (typeof direct === 'number' && Number.isFinite(direct)) return direct;
+  const nested = shaped?.answer?.answer?.total;
+  return typeof nested === 'number' && Number.isFinite(nested) ? nested : null;
+}
+
 /** Runs `fn` against the canary index when the bucket says so, and records the outcome either way. */
 function withCanary<T>(request: Request, context: Context, graph: string, question: string,
   fn: (chosen: { index: ModelIndex; revision: number | null }) => T): T {
-  const route = canaryRoute(context, graph, request.principal.actor, question);
+  const route = canaryRoute(context, graph, request.principal.actor, question, request.group);
   try {
     const result = fn({ index: route.index, revision: route.revision });
+    if (route.side === 'canary' && route.qualityGuard) {
+      // the guard answers the same question on the stable revision: a canary whose *number* moved is a failure even
+      // when it did not throw, which is the whole point of a canary on a model change
+      const stable = fn({ index: route.stableIndex, revision: null });
+      const canaryTotal = totalOf(result);
+      const stableTotal = totalOf(stable);
+      if (canaryTotal !== null && stableTotal !== null && stableTotal !== 0) {
+        const moved = Math.abs(canaryTotal / stableTotal - 1);
+        if (moved > route.qualityGuard.maxRelativeDelta) {
+          route.store!.record({
+            kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
+            detail: `quality: total moved ${(moved * 100).toFixed(2)}% (canary ${canaryTotal.toFixed(2)} vs stable ${stableTotal.toFixed(2)}), limit ${(route.qualityGuard.maxRelativeDelta * 100).toFixed(2)}%`,
+          });
+          route.store!.autoRollbackAfterErrors({ actor: 'canary-guard' });
+          return result;
+        }
+      }
+    }
     if (route.side === 'canary') {
       const shaped = result as unknown as { refusals?: unknown[]; plan?: unknown } | null;
       const refused = typeof shaped === 'object' && shaped !== null

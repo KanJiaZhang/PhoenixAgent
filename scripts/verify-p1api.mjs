@@ -82,7 +82,7 @@ try {
   section('1. the catalogue carries the new routes, with their roles');
   const catalogue = await http('GET', '/v1/tools');
   const tools = catalogue.body.tools;
-  check('the catalogue grew', tools.length >= 35, `${tools.length} routes`);
+  check('the catalogue grew', tools.length >= 38, `${tools.length} routes`);
   const expected = [
     ['POST', '/v1/semantic/version', 'viewer'],
     ['POST', '/v1/semantic/shadow', 'viewer'],
@@ -95,6 +95,9 @@ try {
     ['POST', '/v1/campaign/writeback', 'analyst'],
     ['GET', '/v1/semantic/release', 'viewer'],
     ['POST', '/v1/semantic/release', 'owner'],
+    ['GET', '/v1/semantic/lexicon/drafts', 'viewer'],
+    ['POST', '/v1/semantic/lexicon/drafts', 'analyst'],
+    ['POST', '/v1/semantic/lexicon/drafts/:id', 'analyst'],
   ];
   for (const [method, path, role] of expected) {
     const tool = tools.find((entry) => entry.method === method && entry.path === path);
@@ -109,7 +112,7 @@ try {
   check('the release tab is in the page', consolePage.includes('data-tab="release"'));
   check('the page has five workbenches', (consolePage.match(/data-tab=/g) ?? []).length === 5,
     `${(consolePage.match(/data-tab=/g) ?? []).length} tabs`);
-  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback']) {
+  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback', '/v1/semantic/release', '/v1/semantic/lexicon/drafts']) {
     check(`the console calls ${path}`, consoleScript.includes(path));
   }
 

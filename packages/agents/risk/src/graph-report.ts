@@ -19,18 +19,18 @@ import type { QueryRunner } from '../../../dataplane/src/sqlite.ts';
 import type { GraphClient } from '../../../core/src/graph-client.ts';
 import { evaluateFeature, type FeatureReport, type LabelledValue } from './features.ts';
 import {
-  buildSnapshots, confirmedLabelsByAccount, featureValue, featuresAt, GRAPH_FEATURES,
-  neighbourLabelStats, publishAndCrossCheck, type CrossCheck, type EntityLink,
+  buildSnapshots, periodOf, confirmedLabelsByAccount, featureValue, featuresAt, GRAPH_FEATURES,
+  neighbourLabelStats, publishAndCrossCheck, type CrossCheck, type EntityLink, type SnapshotGrain,
 } from './graph.ts';
 import { evaluate, fitLogistic, fitStandardizer, type Sample } from './model.ts';
 
 export interface GraphReport {
   agent: 'risk-graph';
   window: { from: string; to: string; events: number; frauds: number; rate: number };
-  snapshot: { months: number; asOf: string; accounts: number; devices: number; ips: number; edges: number };
+  snapshot: { grain: SnapshotGrain; periods: number; asOf: string; accounts: number; devices: number; ips: number; edges: number };
   features: FeatureReport[];
-  /** One point per month: the signal has to *arrive*, and a snapshot that knew the future would arrive early. */
-  progression: { month: string; asOf: string; accounts: number; ringComponentSize: number; auc: number; positives: number }[];
+  /** One point per period: the signal has to *arrive*, and a snapshot that knew the future would arrive early. */
+  progression: { period: string; asOf: string; accounts: number; ringComponentSize: number; auc: number; positives: number }[];
   models: {
     split: { cutoff: string; train: { from: string; to: string; events: number; frauds: number }; test: { from: string; to: string; events: number; frauds: number } };
     base: { features: string[]; auc: number; rows: number; positives: number };
@@ -65,6 +65,8 @@ export interface GraphReportOptions {
   run: QueryRunner;
   /** First month of the test window (default 2025-07: the last six months). */
   cutoff?: string;
+  /** Snapshot grain: a month of structure (default) or a week. */
+  grain?: SnapshotGrain;
   minPositives?: number;
   /** When present, the newest snapshot is published and traversed by the base as a second opinion. */
   client?: GraphClient;
@@ -83,6 +85,7 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   const sql: string[] = [];
   const cutoff = options.cutoff ?? '2025-07';
   const minPositives = options.minPositives ?? 30;
+  const grain: SnapshotGrain = options.grain ?? 'month';
   const runQuery = (statement: string) => {
     sql.push(statement);
     return options.run(statement);
@@ -109,39 +112,43 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   const links: EntityLink[] = events.map((event) => ({
     eventId: event.id, date: event.date, account: event.account, device: event.device, ip: event.ip,
   }));
-  const snapshots = buildSnapshots(links);
-  const months = [...snapshots.keys()].sort();
-  const newest = snapshots.get(months[months.length - 1]!)!;
+  const snapshots = buildSnapshots(links, grain);
+  const periods = [...snapshots.keys()].sort();
+  const newest = snapshots.get(periods[periods.length - 1]!)!;
+  // every date-shaped lookup below is by period key; the event's own period is computed once, at the chosen grain
+  const periodKeyOf = new Map(events.map((event) => [event.id, periodOf(event.date, grain).key]));
+  const periodsOfEvent = (event: typeof events[number]) => periodKeyOf.get(event.id)!;
 
   // --- per-feature evaluation, with the point-in-time date carried per value
   const graphValues = new Map<string, LabelledValue[]>(GRAPH_FEATURES.map((name) => [name, []]));
   const featureRows = events.map((event) => {
-    const snapshot = snapshots.get(event.month);
-    const features = snapshot ? featuresAt(snapshots, event.month, event.account) : null;
+    const period = periodsOfEvent(event);
+    const snapshot = snapshots.get(period);
+    const features = snapshot ? featuresAt(snapshots, period, event.account) : null;
     const asOfBeforeEvent = snapshot ? snapshot.asOf <= event.date : false;
     // An account the snapshot has never seen has no graph evidence: that is a coverage gap, not a leak. Counting it
     // as a violation would blame the point-in-time gate for a cold start, and counting it as a zero value would
     // invent structure - so it is left out, and the coverage number reports how many were left out.
     if (features) {
       for (const name of GRAPH_FEATURES) {
-        graphValues.get(name)!.push({ value: featureValue(features, name), label: event.label, asOfBeforeEvent, window: event.month });
+        graphValues.get(name)!.push({ value: featureValue(features, name), label: event.label, asOfBeforeEvent, window: period });
       }
     }
-    return { event, features, asOfBeforeEvent };
+    return { event, features, asOfBeforeEvent, period };
   });
 
   const features = GRAPH_FEATURES.map((name) => evaluateFeature(name, graphValues.get(name)!, { minPositives }));
 
   // --- monthly progression: the ring has to *form*, and a leaky snapshot would show its strength in month one
-  const progression = months.map((month) => {
-    const snapshot = snapshots.get(month)!;
-    const rows = featureRows.filter((row) => row.event.month === month && row.features);
+  const progression = periods.map((period) => {
+    const snapshot = snapshots.get(period)!;
+    const rows = featureRows.filter((row) => row.period === period && row.features);
     const values: LabelledValue[] = rows.map((row) => ({
-      value: row.features!.sharedDeviceMax, label: row.event.label, asOfBeforeEvent: true, window: month,
+      value: row.features!.sharedDeviceMax, label: row.event.label, asOfBeforeEvent: true, window: period,
     }));
     const report = evaluateFeature('g_shared_device_max', values, { minPositives: 5 });
     const ringSize = Math.max(0, ...[...snapshot.features.values()].map((entry) => entry.componentSize));
-    return { month, asOf: snapshot.asOf, accounts: snapshot.accounts, ringComponentSize: ringSize, auc: report.auc, positives: values.filter((entry) => entry.label === 1).length };
+    return { period, asOf: snapshot.asOf, accounts: snapshot.accounts, ringComponentSize: ringSize, auc: report.auc, positives: values.filter((entry) => entry.label === 1).length };
   });
 
   // --- label propagation, with the cutoff enforced on the labels themselves
@@ -156,7 +163,7 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   const allLabels = confirmedLabelsByAccount(labelRows, '9999-12-31');
   for (const row of featureRows) {
     if (!row.features) continue;
-    const snapshot = snapshots.get(row.event.month)!;
+    const snapshot = snapshots.get(row.period)!;
     const pitStats = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
     const leakyStats = neighbourLabelStats(snapshot, row.event.account, allLabels);
     pitLabelValues.push({ value: pitStats.rate, label: row.event.label, asOfBeforeEvent: snapshot.asOf <= row.event.date, window: row.event.month });
@@ -164,12 +171,12 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   }
   const pitLabelReport = evaluateFeature('g_neighbour_fraud_rate', pitLabelValues, { minPositives });
   const leakyLabelReport = evaluateFeature('g_neighbour_fraud_rate', leakyLabelValues, { minPositives });
-  const labelMonthly = months.map((month) => {
-    const pit = pitLabelValues.filter((value) => value.window === month);
-    const leaky = leakyLabelValues.filter((value) => value.window === month);
+  const labelMonthly = periods.map((period) => {
+    const pit = pitLabelValues.filter((value) => value.window === period);
+    const leaky = leakyLabelValues.filter((value) => value.window === period);
     const positives = pit.filter((value) => value.label === 1).length;
     return {
-      month,
+      month: period,
       positives,
       pit: positives >= 5 ? evaluateFeature('pit', pit, { minPositives: 3 }).auc : Number.NaN,
       leaky: positives >= 5 ? evaluateFeature('leaky', leaky, { minPositives: 3 }).auc : Number.NaN,
@@ -180,7 +187,7 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   let labelCheckIdentical = true;
   let labelCheckCount = 0;
   for (const row of featureRows.filter((entry) => entry.features).slice(0, 500)) {
-    const snapshot = snapshots.get(row.event.month)!;
+    const snapshot = snapshots.get(row.period)!;
     const before = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
     const after = neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf));
     labelCheckCount++;
@@ -244,8 +251,9 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
   // base + structural + the PIT label feature: does neighbour reputation add anything on top of structure?
   const pitByEvent = new Map<string, number>();
   for (const [index, row] of featureRows.entries()) {
+    void index;
     if (!row.features) continue;
-    const snapshot = snapshots.get(row.event.month)!;
+    const snapshot = snapshots.get(row.period)!;
     pitByEvent.set(row.event.id, neighbourLabelStats(snapshot, row.event.account, confirmedLabelsByAccount(labelRows, snapshot.asOf)).rate);
   }
   const rowsWithLabels = (rows: typeof train) => rows.map((row) => ({
@@ -289,7 +297,8 @@ export async function graphFeaturesReport(options: GraphReportOptions): Promise<
       rate: events.length === 0 ? 0 : round(frauds / events.length, 4),
     },
     snapshot: {
-      months: months.length,
+      grain,
+      periods: periods.length,
       asOf: newest.asOf,
       accounts: newest.accounts,
       devices: newest.devices,
