@@ -82,7 +82,7 @@ try {
   section('1. the catalogue carries the new routes, with their roles');
   const catalogue = await http('GET', '/v1/tools');
   const tools = catalogue.body.tools;
-  check('the catalogue grew', tools.length >= 38, `${tools.length} routes`);
+  check('the catalogue grew', tools.length >= 39, `${tools.length} routes`);
   const expected = [
     ['POST', '/v1/semantic/version', 'viewer'],
     ['POST', '/v1/semantic/shadow', 'viewer'],
@@ -98,6 +98,7 @@ try {
     ['GET', '/v1/semantic/lexicon/drafts', 'viewer'],
     ['POST', '/v1/semantic/lexicon/drafts', 'analyst'],
     ['POST', '/v1/semantic/lexicon/drafts/:id', 'analyst'],
+    ['GET', '/v1/semantic/timeline', 'viewer'],
   ];
   for (const [method, path, role] of expected) {
     const tool = tools.find((entry) => entry.method === method && entry.path === path);
@@ -112,7 +113,7 @@ try {
   check('the release tab is in the page', consolePage.includes('data-tab="release"'));
   check('the page has five workbenches', (consolePage.match(/data-tab=/g) ?? []).length === 5,
     `${(consolePage.match(/data-tab=/g) ?? []).length} tabs`);
-  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback', '/v1/semantic/release', '/v1/semantic/lexicon/drafts']) {
+  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback', '/v1/semantic/release', '/v1/semantic/lexicon/drafts', '/v1/semantic/timeline']) {
     check(`the console calls ${path}`, consoleScript.includes(path));
   }
 
@@ -246,6 +247,13 @@ try {
   check('and a payload hash that is not the key', store.every((entry) => entry.payloadHash.length === 32 && entry.payloadHash !== entry.key),
     store[0]?.payloadHash?.slice(0, 8) ?? '');
   delete process.env.PAGENT_WRITEBACK_URL;
+
+  section('6b. the timeline merges the audit, the lexicon and the releases');
+  const timeline = await http('GET', '/v1/semantic/timeline?limit=100');
+  checkEqual('the timeline answers', timeline.status, 200);
+  check('it is ordered', timeline.body.events.every((event, index, all) => index === 0 || all[index - 1].at <= event.at),
+    timeline.body.events.length + ' events');
+  check('and it names the lexicon decisions this run made', timeline.body.counts.lexicon >= 1, JSON.stringify(timeline.body.counts));
 
   section('7. the audit trail covers the new routes');
   const audit = await http('GET', '/v1/audit/recent?limit=200', undefined, 'owner');

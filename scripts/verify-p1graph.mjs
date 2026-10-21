@@ -174,18 +174,16 @@ check('the weekly snapshot knows more than the monthly one for a mid-month event
 check('and each weekly snapshot keeps its own cutoff', [...weekSnapshots.values()].every((snapshot) => snapshot.asOf < snapshot.serves.slice(0, 4) + '-12-31'),
   'cutoffs are dates, not labels');
 
-if (process.env.PAGENT_GRAPH_WEEKLY === '1') {
-  // the full run at the finer grain: 104 snapshots, ~18s. Opt-in, like the base cross-check.
-  const weeklyReport = await graphFeaturesReport({ run, cutoff: '2025-07', grain: 'week' });
-  check('the weekly report uses weekly periods', weeklyReport.snapshot.grain === 'week' && weeklyReport.snapshot.periods >= 100,
-    `${weeklyReport.snapshot.periods} periods`);
-  check('and its point-in-time gate still passes', weeklyReport.features.every((feature) => feature.pointInTime.ok),
-    weeklyReport.features.map((feature) => feature.pointInTime.violations).join(','));
-  check('the increment survives the finer grain', Math.abs(weeklyReport.models.increment - report.models.increment) < 0.01,
-    `month ${report.models.increment} vs week ${weeklyReport.models.increment}`);
-} else {
-  console.log('  skip  set PAGENT_GRAPH_WEEKLY=1 to run the full 104-week report (about 18s)');
-}
+// the full run at the finer grain: 104 snapshots. It got cheap enough to keep in the default suite
+// (1.0s for the snapshots, 5.2s for the whole report) once the adjacency became a compressed array.
+const weeklyReport = await graphFeaturesReport({ run, cutoff: '2025-07', grain: 'week' });
+check('the weekly report uses weekly periods', weeklyReport.snapshot.grain === 'week' && weeklyReport.snapshot.periods >= 100,
+  `${weeklyReport.snapshot.periods} periods`);
+check('and its point-in-time gate still passes', weeklyReport.features.every((feature) => feature.pointInTime.ok),
+  weeklyReport.features.map((feature) => feature.pointInTime.violations).join(','));
+check('the increment survives the finer grain', Math.abs(weeklyReport.models.increment - report.models.increment) < 0.01,
+  `month ${report.models.increment} vs week ${weeklyReport.models.increment}`);
+check('weekly snapshots are cheap enough to be a default option', weeklyReport.cost.ms < 15000, `${weeklyReport.cost.ms} ms`);
 
 section('determinism: a second run produces identical numbers');
 const again = await graphFeaturesReport({ run, cutoff: '2025-07' });

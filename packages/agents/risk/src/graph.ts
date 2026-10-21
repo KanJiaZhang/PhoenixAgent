@@ -109,22 +109,40 @@ export function periodOf(date: string, grain: SnapshotGrain): { key: string; asO
   return { key: week.key, asOf: start.toISOString().slice(0, 10) };
 }
 
+interface Accumulated {
+  accountDevices: Map<string, Set<string>>;
+  accountIps: Map<string, Set<string>>;
+  deviceAccounts: Map<string, Set<string>>;
+  ipAccounts: Map<string, Set<string>>;
+  used: EntityLink[];
+}
+
+function emptyAccumulated(): Accumulated {
+  return { accountDevices: new Map(), accountIps: new Map(), deviceAccounts: new Map(), ipAccounts: new Map(), used: [] };
+}
+
+/** Adds one link. Monotone: nothing is ever removed, which is what lets a series walk the dates once. */
+function accumulate(target: Accumulated, link: EntityLink): void {
+  target.used.push(link);
+  addTo(target.accountDevices, link.account, link.device);
+  addTo(target.accountIps, link.account, link.ip);
+  addTo(target.deviceAccounts, link.device, link.account);
+  addTo(target.ipAccounts, link.ip, link.account);
+}
+
 /** Builds one snapshot from the links known by `asOf` (inclusive). */
 export function buildSnapshot(links: EntityLink[], asOf: string, serves: string): GraphSnapshot {
-  const accountDevices = new Map<string, Set<string>>();
-  const accountIps = new Map<string, Set<string>>();
-  const deviceAccounts = new Map<string, Set<string>>();
-  const ipAccounts = new Map<string, Set<string>>();
-  const used: EntityLink[] = [];
-
+  const accumulated = emptyAccumulated();
   for (const link of links) {
     if (link.date > asOf) continue;
-    used.push(link);
-    addTo(accountDevices, link.account, link.device);
-    addTo(accountIps, link.account, link.ip);
-    addTo(deviceAccounts, link.device, link.account);
-    addTo(ipAccounts, link.ip, link.account);
+    accumulate(accumulated, link);
   }
+  return snapshotFromState(accumulated, asOf, serves);
+}
+
+/** The snapshot itself, from an already-accumulated state. Pure: it reads the state and never mutates it. */
+function snapshotFromState(accumulated: Accumulated, asOf: string, serves: string): GraphSnapshot {
+  const { accountDevices, accountIps, deviceAccounts, ipAccounts, used } = accumulated;
 
   // connected components over the three node types, sized in accounts
   const parent = new Map<string, string>();
@@ -203,12 +221,22 @@ export function buildSnapshot(links: EntityLink[], asOf: string, serves: string)
  * event entitled to".
  */
 export function buildSnapshots(links: EntityLink[], grain: SnapshotGrain = 'month'): Map<string, GraphSnapshot> {
-  const keys = new Map<string, { key: string; asOf: string }>();
-  for (const link of links) keys.set(periodOf(link.date, grain).key, periodOf(link.date, grain));
+  const cutoffs = new Map<string, { key: string; asOf: string }>();
+  for (const link of links) {
+    const period = periodOf(link.date, grain);
+    cutoffs.set(period.key, period);
+  }
+  const ordered = [...cutoffs.values()].sort((left, right) => left.key.localeCompare(right.key));
+  // One pass over the links instead of one pass per period: the state only grows, so a period's snapshot is
+  // "everything applied so far". The per-snapshot work (components, features, PageRank) is unchanged - that is the
+  // part that has to look at the whole graph anyway.
+  const sorted = [...links].sort((left, right) => left.date.localeCompare(right.date));
+  const accumulated = emptyAccumulated();
+  let cursor = 0;
   const snapshots = new Map<string, GraphSnapshot>();
-  for (const key of [...keys.keys()].sort()) {
-    // the cutoff was computed from the first date that landed in this period; every date in it shares the same one
-    snapshots.set(key, buildSnapshot(links, keys.get(key)!.asOf, key));
+  for (const { key, asOf } of ordered) {
+    while (cursor < sorted.length && sorted[cursor]!.date <= asOf) accumulate(accumulated, sorted[cursor++]!);
+    snapshots.set(key, snapshotFromState(accumulated, asOf, key));
   }
   return snapshots;
 }
@@ -228,38 +256,56 @@ function pagerankOf(
   damping = 0.85,
 ): Map<string, number> {
   const accounts = [...accountDevices.keys()];
-  const nodeIds = [
-    ...accounts,
-    ...[...deviceAccounts.keys()].map((id) => `d:${id}`),
-    ...[...ipAccounts.keys()].map((id) => `i:${id}`),
-  ];
-  if (nodeIds.length === 0) return new Map();
-  const rank = new Map<string, number>(nodeIds.map((node) => [node, 1 / nodeIds.length]));
-  // The adjacency is materialised once per snapshot: rebuilding it inside every iteration was the difference between
-  // a weekly run taking 29 seconds and a second or so.
-  const adjacency: { node: string; targets: string[] }[] = [];
-  for (const node of nodeIds) {
-    const targets = node.startsWith('d:')
-      ? [...(deviceAccounts.get(node.slice(2)) ?? [])]
-      : node.startsWith('i:')
-        ? [...(ipAccounts.get(node.slice(2)) ?? [])]
-        : [...(accountDevices.get(node) ?? [])].map((id) => `d:${id}`)
-          .concat([...(accountIps.get(node) ?? [])].map((id) => `i:${id}`));
-    if (targets.length > 0) adjacency.push({ node, targets });
+  const deviceIds = [...deviceAccounts.keys()];
+  const ipIds = [...ipAccounts.keys()];
+  const nodeCount = accounts.length + deviceIds.length + ipIds.length;
+  if (nodeCount === 0) return new Map();
+
+  // Indices instead of string keys, and a compressed adjacency instead of Map-of-Sets: PageRank touches every edge
+  // twenty times per snapshot, so the representation is the cost. Same 20 iterations, same damping, same answer.
+  const index = new Map<string, number>();
+  for (const [offset, account] of accounts.entries()) index.set(account, offset);
+  for (const [offset, device] of deviceIds.entries()) index.set(`d:${device}`, accounts.length + offset);
+  for (const [offset, ip] of ipIds.entries()) index.set(`i:${ip}`, accounts.length + deviceIds.length + offset);
+
+  const offsets = new Int32Array(nodeCount + 1);
+  const targets: number[] = [];
+  const push = (from: number, to: number) => {
+    targets.push(to);
+    offsets[from + 1] = offsets[from + 1]! + 1;
+  };
+  for (const [offset, account] of accounts.entries()) {
+    for (const device of accountDevices.get(account) ?? []) push(offset, index.get(`d:${device}`)!);
+    for (const ip of accountIps.get(account) ?? []) push(offset, index.get(`i:${ip}`)!);
   }
-  const base = (1 - damping) / nodeIds.length;
-  const next = new Map<string, number>();
+  for (const [offset, device] of deviceIds.entries()) {
+    for (const account of deviceAccounts.get(device) ?? []) push(accounts.length + offset, index.get(account)!);
+  }
+  for (const [offset, ip] of ipIds.entries()) {
+    for (const account of ipAccounts.get(ip) ?? []) push(accounts.length + deviceIds.length + offset, index.get(account)!);
+  }
+  for (let node = 0; node < nodeCount; node++) offsets[node + 1]! += offsets[node]!;
+  const edgeTargets = Int32Array.from(targets);
+
+  const base = (1 - damping) / nodeCount;
+  let rank = new Float64Array(nodeCount).fill(1 / nodeCount);
+  let next = new Float64Array(nodeCount);
   for (let step = 0; step < iterations; step++) {
-    next.clear();
-    for (const node of nodeIds) next.set(node, base);
-    for (const { node, targets } of adjacency) {
-      const share = (damping * rank.get(node)!) / targets.length;
-      for (const target of targets) next.set(target, (next.get(target) ?? 0) + share);
+    next.fill(base);
+    for (let node = 0; node < nodeCount; node++) {
+      const from = offsets[node]!;
+      const to = offsets[node + 1]!;
+      if (to === from) continue;
+      const share = (damping * rank[node]!) / (to - from);
+      for (let edge = from; edge < to; edge++) next[edgeTargets[edge]!]! += share;
     }
-    for (const [node, value] of next) rank.set(node, value);
+    const swap = rank;
+    rank = next;
+    next = swap;
   }
+
   const out = new Map<string, number>();
-  for (const account of accounts) out.set(account, rank.get(account) ?? 0);
+  for (const [offset, account] of accounts.entries()) out.set(account, rank[offset]!);
   return out;
 }
 

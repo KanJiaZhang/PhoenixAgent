@@ -28,8 +28,15 @@ export interface ReleaseConfig {
   startedAt: string;
   startedBy: string;
   probeQuestion?: string;
-  /** When set, only requests carrying one of these groups are eligible for the canary. */
-  scope?: { groups: string[] };
+  /**
+   * Who and what the canary applies to.
+   *
+   * `groups` is membership (an `x-pagent-group` header). `dimension`/`values` is the answer slice: only a question
+   * that explicitly filters that dimension to one of those values is eligible. A question without a filter is *not*
+   * the slice - it is everyone, and rolling "everyone" out under the name of 华东 is how a scoped release stops being
+   * scoped.
+   */
+  scope?: { groups?: string[]; dimension?: string; values?: string[] };
   /** When set, a canary answer whose total moves further than this against the stable answer is a failure. */
   qualityGuard?: { maxRelativeDelta: number };
   promote?: { at: string; actor: string; answers: number; errors: number; shadow?: string };
@@ -103,7 +110,7 @@ export class ReleaseStore {
 
   start(options: {
     from: number; to: number; canaryPct: number; actor: string; now?: string; probeQuestion?: string;
-    scope?: { groups: string[] }; qualityGuard?: { maxRelativeDelta: number };
+    scope?: { groups?: string[]; dimension?: string; values?: string[] }; qualityGuard?: { maxRelativeDelta: number };
   }): ReleaseConfig {
     const existing = this.get();
     if (existing?.status === 'running') {
@@ -122,7 +129,14 @@ export class ReleaseStore {
       startedAt: options.now ?? new Date().toISOString(),
       startedBy: options.actor,
       ...(options.probeQuestion ? { probeQuestion: options.probeQuestion } : {}),
-      ...(options.scope?.groups.length ? { scope: { groups: options.scope.groups } } : {}),
+      ...(options.scope && (options.scope.groups?.length || options.scope.dimension)
+        ? {
+          scope: {
+            ...(options.scope.groups?.length ? { groups: options.scope.groups } : {}),
+            ...(options.scope.dimension ? { dimension: options.scope.dimension, values: options.scope.values ?? [] } : {}),
+          },
+        }
+        : {}),
       ...(options.qualityGuard ? { qualityGuard: options.qualityGuard } : {}),
     };
     this.write(config);
@@ -254,7 +268,8 @@ export function bucketOf(actor: string, question: string): number {
  * A promoted release serves the new revision to everyone; a rolled-back one serves nobody; a running one uses the
  * bucket. There is no "random" branch, which is what makes a canary reproducible from the request alone.
  */
-export function pickRevision(config: ReleaseConfig | null, actor: string, question: string, group?: string): {
+export function pickRevision(config: ReleaseConfig | null, actor: string, question: string, group?: string,
+  filters?: { dimension: string; value: string }[]): {
   revision: 'stable' | 'canary';
   bucket: number;
   side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none' | 'out-of-scope';
@@ -264,8 +279,17 @@ export function pickRevision(config: ReleaseConfig | null, actor: string, questi
   if (config.status === 'promoted') return { revision: 'canary', bucket, side: 'promoted' };
   if (config.status === 'rolled-back') return { revision: 'stable', bucket, side: 'rolled-back' };
   // a scoped release excludes everyone outside it before the bucket is even consulted
-  if (config.scope?.groups.length && !(group && config.scope.groups.includes(group))) {
+  if (config.scope?.groups?.length && !(group && config.scope.groups.includes(group))) {
     return { revision: 'stable', bucket, side: 'out-of-scope' };
+  }
+  if (config.scope?.dimension) {
+    const wanted = config.scope.values ?? [];
+    const target = config.scope.dimension;
+    const bare = target.startsWith('dim/') ? target.slice(4) : target;
+    const match = (filters ?? []).some((filter) =>
+      (filter.dimension === target || filter.dimension === bare)
+      && (wanted.length === 0 || wanted.includes(filter.value)));
+    if (!match) return { revision: 'stable', bucket, side: 'out-of-scope' };
   }
   return bucket < config.canaryPct
     ? { revision: 'canary', bucket, side: 'canary' }

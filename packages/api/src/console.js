@@ -200,6 +200,16 @@ document.querySelectorAll('[data-act]').forEach((button) => {
       if (!reason) return show(releaseOut2, { note: '回滚需要理由，已取消' });
       return show(releaseOut2, await api('POST', '/v1/semantic/release', { action: 'rollback', reason }));
     }
+    if (action === 'release-timeline') {
+      const result = await api('GET', '/v1/semantic/timeline?limit=60');
+      if (!result.ok) return show(releaseOut2, result);
+      const rows = result.body.events.map((event) => '<tr><td class="muted">' + escapeHtml(event.at) + '</td>' +
+        '<td><span class="pill">' + escapeHtml(event.kind) + '</span></td><td>' + escapeHtml(event.actor) + '</td>' +
+        '<td>' + escapeHtml(event.detail) + '</td></tr>').join('');
+      releaseOut2.innerHTML = '<div class="muted">' + JSON.stringify(result.body.counts) + '</div>' +
+        '<table><thead><tr><th>时间</th><th>类型</th><th>谁</th><th>什么</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      return;
+    }
     if (action === 'release-drafts') {
       const result = await api('GET', '/v1/semantic/lexicon/drafts?status=pending');
       if (!result.ok) return show(releaseOut2, result);

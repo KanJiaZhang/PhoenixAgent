@@ -18,6 +18,7 @@ import { check, checkEqual, section, summary } from './verify-lib.mjs';
 import { sqliteRunner } from '../packages/dataplane/src/sqlite.ts';
 import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { build } from '../packages/semantic/src/pipeline.ts';
+import { ask } from '../packages/semantic/src/ask/query.ts';
 import { indexModel } from '../packages/semantic/src/sql.ts';
 import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion } from '../packages/semantic/src/ask/index.ts';
 
@@ -229,7 +230,27 @@ const stillPending = queue.pending();
 check('and it is still pending: the model proposed, nobody certified', stillPending.length === 1 && stillPending[0].status === 'pending',
   stillPending.map((draft) => draft.word).join(','));
 
-section('10. determinism');
+section('10. value filters: a slice is a spec, and it is checked against hand-written SQL');
+const sliceSpec = {
+  metric: 'metric/spend', dimensions: ['dim/region'],
+  period: { from: '2025-11-01', to: '2025-12-01', grain: 'month', said: '2025-11' },
+  filters: [{ dimension: 'dim/region', value: '华东' }], descending: true, matched: [],
+};
+const sliced = ask({ spec: sliceSpec, index, run });
+check('a filtered spec answers', sliced.plan !== undefined && sliced.answer.rows.length === 1, `${sliced.answer?.rows?.length} rows`);
+check('the filter became a predicate in the SQL', sliced.plan.filters.some((predicate) => predicate.includes('region_name') && predicate.includes("'华东'")),
+  sliced.plan.filters.join(' AND '));
+check('... and it is in the statement, not only in the plan', sliced.plan.sql[0].includes("'华东'"), sliced.plan.sql[0].slice(-90));
+const handed = run(`SELECT SUM(f.spend) AS v FROM fact_ad_daily f JOIN dim_region r ON f.region_id = r.region_id
+  WHERE f.date_key >= '2025-11-01' AND f.date_key < '2025-12-01' AND r.region_name = '华东'`).rows[0];
+check('and the number matches a hand-written query', Math.abs(sliced.answer.total - Number(handed.v)) < 0.01,
+  `${sliced.answer.total} vs ${Number(handed.v).toFixed(2)}`);
+const unknownFilter = ask({ spec: { ...sliceSpec, filters: [{ dimension: 'dim/nowhere', value: 'x' }] }, index, run });
+checkEqual('an unknown dimension in a filter is refused', unknownFilter.refusals?.[0]?.code, 'no-such-dimension');
+const crossFilter = ask({ spec: { ...sliceSpec, metric: 'metric/capture_rate', dimensions: [], filters: [{ dimension: 'dim/region', value: '华东' }] }, index, run });
+checkEqual('a cross-fact metric refuses filters instead of silently ignoring them', crossFilter.refusals?.[0]?.code, 'not-in-model');
+
+section('11. determinism');
 const again = await askHybrid({ question: '2025 年 11 月各大区毛利', index, run, workspace, graph, now });
 check('the same question gives the same SQL', again.plan?.sql[0] === afterLearning.plan?.sql[0], 'identical statements');
 

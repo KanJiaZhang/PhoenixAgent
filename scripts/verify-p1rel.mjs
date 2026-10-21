@@ -20,7 +20,10 @@ import { join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { check, checkEqual, section, summary } from './verify-lib.mjs';
 import { build } from '../packages/semantic/src/pipeline.ts';
+import { indexModel } from '../packages/semantic/src/sql.ts';
 import { bucketOf, pickRevision, ReleaseStore } from '../packages/semantic/src/release.ts';
+import { learnWord } from '../packages/semantic/src/ask/index.ts';
+import { ReviewLog } from '../packages/semantic/src/review.ts';
 import { createAgentServer } from '../packages/api/src/server.ts';
 
 const root = process.cwd();
@@ -199,6 +202,29 @@ try {
   checkEqual('pickRevision agrees, out of scope', pickRevision(scoped.body, 'anyone', 'q', 'alpha').side, 'out-of-scope');
   await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'scope test done' }, 'owner');
 
+  section('7b. a canary can be scoped to a slice of the answer, not just to people');
+  const dimensionScoped = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 2, canaryPct: 100, scope: { dimension: 'dim/region', values: ['华东'] },
+  }, 'owner');
+  checkEqual('the slice is stored with the release', dimensionScoped.body.scope?.dimension, 'dim/region');
+  checkEqual('with the values it covers', JSON.stringify(dimensionScoped.body.scope?.values), '["华东"]');
+  const filtered = (value) => ({
+    spec: {
+      metric: 'metric/spend', dimensions: ['dim/region'],
+      period: { from: '2025-11-01', to: '2025-12-01', grain: 'month', said: '2025-11' },
+      filters: [{ dimension: 'dim/region', value }], descending: true, matched: [],
+    },
+  });
+  const inSlice = await http('POST', '/v1/semantic/ask', filtered('华东'), 'canary-key');
+  checkEqual('a question filtered to the slice gets the canary', inSlice.body.plan.modelRevision, 2);
+  const otherSlice = await http('POST', '/v1/semantic/ask', filtered('华南'), 'canary-key');
+  check('another slice stays on the stable revision',
+    otherSlice.body.plan.modelRevision === null || otherSlice.body.plan.modelRevision === 1, `${otherSlice.body.plan.modelRevision}`);
+  const unfiltered = await http('POST', '/v1/semantic/ask', { question }, 'canary-key');
+  check('and an unfiltered question is not the slice',
+    unfiltered.body.plan.modelRevision === null || unfiltered.body.plan.modelRevision === 1, `${unfiltered.body.plan.modelRevision}`);
+  await http('POST', '/v1/semantic/release', { action: 'rollback', reason: 'slice test done' }, 'owner');
+
   section('8. a canary whose number moves is a failure, not just a slow release');
   const guarded = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, qualityGuard: { maxRelativeDelta: 0.02 },
@@ -219,7 +245,34 @@ try {
   checkEqual('three of them stop the release', afterQuality.config.status, 'rolled-back');
   check('and the reason is the guard\'s', /consecutive canary errors/.test(afterQuality.config.rollback.reason), afterQuality.config.rollback.reason);
 
-  section('9. replaying a release decision is not a way around the gate');
+  section('9. one timeline: what changed, when, and who said yes');
+  // a learned word and a review line, so the timeline has more than one source
+  const timelineIndex = indexModel(built);
+  learnWord({
+    workspace, graph, index: timelineIndex, word: '投放总额', target: 'metric/spend',
+    source: 'review', model: 'bob', evidence: 'timeline test', now: '2026-10-29T00:05:00.000Z',
+  });
+  new ReviewLog(join(workspace, 'reviews', `${graph}.jsonl`)).append({
+    ts: '2026-10-29T00:06:00.000Z', actor: 'bob', action: 'accept', target: 'metric/cac', reason: 'timeline test',
+  });
+  const timeline = await http('GET', '/v1/semantic/timeline?limit=500');
+  checkEqual('the timeline answers', timeline.status, 200);
+  const kinds = new Set(timeline.body.events.map((event) => event.kind));
+  check('it merges release, lexicon and review records', kinds.has('release') && kinds.has('lexicon') && kinds.has('review'),
+    [...kinds].join(','));
+  check('every release decision is there with its actor', timeline.body.events.some((event) => event.kind === 'release' && event.actor === 'alice' && /rollback/.test(event.detail)),
+    timeline.body.events.filter((event) => event.kind === 'release').slice(-2).map((event) => `${event.actor}:${event.detail.slice(0, 30)}`).join(' | '));
+  check('the auto rollback is attributed to the guard', timeline.body.events.some((event) => event.actor === 'canary-guard'),
+    timeline.body.counts.release + ' release events');
+  checkEqual('the learned word is on the timeline', timeline.body.counts.lexicon, 1);
+  const sorted = timeline.body.events.every((event, index, all) => index === 0 || all[index - 1].at <= event.at);
+  check('the events are in order', sorted, `${timeline.body.events.length} events`);
+  check('each kind names its source file', Object.values(timeline.body.sources).every((source) => source.includes('release') || source.includes('lexicon') || source.includes('reviews') || source.includes('audit')),
+    Object.keys(timeline.body.sources).length + ' sources');
+  const again2 = await http('GET', '/v1/semantic/timeline?limit=500');
+  checkEqual('and the same history gives the same timeline', JSON.stringify(again2.body.events), JSON.stringify(timeline.body.events));
+
+  section('10. replaying a release decision is not a way around the gate');
   const store = new ReleaseStore(workspace, graph);
   checkEqual('the store reads back what the API wrote', store.get().status, 'rolled-back');
   check('and the auto rollback is in the event log', store.events().some((event) => event.kind === 'rollback' && event.actor === 'canary-guard'));

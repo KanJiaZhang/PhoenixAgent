@@ -66,7 +66,11 @@ export function translate(request: TranslateRequest): TranslateResult {
   const filters = periodFilters(request.index, spec);
   if (filters.refusal) return { plan: null, refusals: [filters.refusal], notes: interpreted.notes };
 
+  const valueFilters = valuePredicates(request.index, spec, metric.payload.crossFact !== undefined);
+  if (valueFilters.refusal) return { plan: null, refusals: [valueFilters.refusal], notes: interpreted.notes };
+
   try {
+    const predicates = [...filters.predicates, ...valueFilters.predicates];
     const dimension = spec.dimensions[0];
     // A cross-fact ratio cannot take the generic period predicate: each side needs its own date column, which the
     // cross-fact renderer knows about and this one does not.
@@ -75,14 +79,14 @@ export function translate(request: TranslateRequest): TranslateResult {
         ...(spec.period ? { period: { from: spec.period.from, to: spec.period.to } } : {}),
       })
       : dimension
-        ? renderByDimension(request.index, spec.metric, dimension, filters.predicates)
-        : renderTotal(request.index, spec.metric, filters.predicates);
+        ? renderByDimension(request.index, spec.metric, dimension, predicates)
+        : renderTotal(request.index, spec.metric, predicates);
     const sql = spec.topN && dimension ? withTopN(rendered.sql, spec.topN, spec.descending) : rendered.sql;
     return {
       plan: {
         spec,
         sql: [sql],
-        filters: filters.predicates,
+        filters: predicates,
         findings: analyze(sql, { catalog: undefined }),
         modelRevision: request.modelRevision ?? null,
         metricDefinition: {
@@ -108,6 +112,62 @@ export function translate(request: TranslateRequest): TranslateResult {
     }
     throw error;
   }
+}
+
+/**
+ * Turns explicit value filters into SQL predicates.
+ *
+ * A filter is only accepted when it names a dimension the metric can actually be sliced by and a dimension whose
+ * column survives the metric's own tables; anything else is a refusal, because "filter by region" on a metric with no
+ * region is the kind of quiet no-op that makes a report lie. Cross-fact metrics refuse filters outright: their two
+ * sides each have their own date column and their own tables, and a single predicate cannot be aimed at both.
+ */
+function valuePredicates(index: ModelIndex, spec: QuerySpec, isCrossFact: boolean): {
+  predicates: string[];
+  refusal?: AgentRefusal;
+} {
+  const requested = spec.filters ?? [];
+  if (requested.length === 0) return { predicates: [] };
+  if (isCrossFact) {
+    return {
+      predicates: [],
+      refusal: {
+        code: 'not-in-model',
+        message: '跨事实指标不接受值过滤：两侧各用自己的日期列与表，一条谓词无法同时指向两边',
+        hint: '先在单事实指标上过滤，或把过滤条件写进跨事实的分子/分母定义',
+      },
+    };
+  }
+  const sliceable = new Set(index.groupedBy.filter((edge) => edge.from === spec.metric).map((edge) => edge.to));
+  const predicates: string[] = [];
+  for (const filter of requested) {
+    const dimension = index.dimensions.find((entry) => entry.id === filter.dimension)
+      ?? index.dimensions.find((entry) => entry.payload.name === filter.dimension);
+    if (!dimension) {
+      return {
+        predicates: [],
+        refusal: {
+          code: 'no-such-dimension',
+          message: `过滤引用了不存在的维度「${filter.dimension}」`,
+          hint: `可用维度：${[...sliceable].join('、') || '（无）'}`,
+          candidates: [...sliceable],
+        },
+      };
+    }
+    if (!sliceable.has(dimension.id)) {
+      return {
+        predicates: [],
+        refusal: {
+          code: 'no-such-dimension',
+          message: `「${dimension.payload.name}」不能用来切分该指标`,
+          hint: `可用维度：${[...sliceable].join('、')}`,
+          candidates: [...sliceable],
+        },
+      };
+    }
+    predicates.push(`${dimensionValueExpr(dimension.payload)} = '${String(filter.value).replace(/'/g, "''")}'`);
+  }
+  return { predicates };
 }
 
 export interface AskResult {

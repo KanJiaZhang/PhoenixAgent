@@ -37,6 +37,7 @@ import { campaign } from '../../agents/campaign/src/index.ts';
 import { analyseRuleSet, capacityPlan, graphFeaturesReport, riskAgent, RiskApprovals } from '../../agents/risk/src/index.ts';
 import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from '../../semantic/src/version.ts';
 import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
+import { buildTimeline } from '../../semantic/src/timeline.ts';
 import { ask, askHybrid, AskSession, DraftQueue, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
 import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
@@ -493,13 +494,22 @@ function buildRoutes(): RouteDef[] {
             }
           }
           try {
-            const scope = request.body.scope as { groups?: unknown } | undefined;
+            const scope = request.body.scope as { groups?: unknown; dimension?: unknown; values?: unknown } | undefined;
             const guard = request.body.qualityGuard as { maxRelativeDelta?: unknown } | undefined;
             return store.start({
               from, to, canaryPct: Number(request.body.canaryPct ?? 10),
               actor: request.principal.actor, now,
               ...(typeof request.body.question === 'string' ? { probeQuestion: request.body.question } : {}),
-              ...(Array.isArray(scope?.groups) ? { scope: { groups: scope.groups.map(String) } } : {}),
+              ...(scope && (Array.isArray(scope.groups) || typeof scope.dimension === 'string')
+                ? {
+                  scope: {
+                    ...(Array.isArray(scope.groups) ? { groups: scope.groups.map(String) } : {}),
+                    ...(typeof scope.dimension === 'string'
+                      ? { dimension: scope.dimension, values: Array.isArray(scope.values) ? scope.values.map(String) : [] }
+                      : {}),
+                  },
+                }
+                : {}),
               ...(guard && Number.isFinite(Number(guard.maxRelativeDelta))
                 ? { qualityGuard: { maxRelativeDelta: Number(guard.maxRelativeDelta) } }
                 : {}),
@@ -923,7 +933,8 @@ function buildRoutes(): RouteDef[] {
         });
         if (routing.side === 'canary') {
           routing.store!.record({
-            kind: 'answer', revision: routing.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
+            ts: context.options.now(), kind: 'answer', revision: routing.revision ?? 0, side: 'canary',
+            actor: request.principal.actor, question,
           });
         }
         const sessionId = `s${Date.now().toString(36)}${(sessionsBefore % 1296).toString(36)}`;
@@ -987,6 +998,18 @@ function buildRoutes(): RouteDef[] {
           ...(target === undefined ? {} : { targetServiceLevel: target }),
           ...(sla === undefined ? {} : { slaHours: sla }),
         });
+      },
+    },
+    {
+      method: 'GET', path: '/v1/semantic/timeline', role: 'viewer',
+      summary: 'one merged history: reviews, publishes, releases, learned words and drafts, in order',
+      input: ['graph', 'limit'],
+      handler: (request, context) => {
+        const graph = String(request.query.get('graph') ?? context.options.graph);
+        const timeline = buildTimeline({ workspace: context.options.workspace, graph, auditPath: context.auditPath });
+        const limit = Number(request.query.get('limit') ?? 200);
+        const events = timeline.events.slice(-Math.max(1, Math.min(limit, 2000)));
+        return { ...timeline, events, counts: timeline.counts };
       },
     },
     {
@@ -1130,7 +1153,8 @@ function executeRisk(context: Context, options: Record<string, unknown>): unknow
  * A running release splits traffic by a sticky bucket; the canary side loads the snapshot of `toRevision`. Everything
  * else - no release, a rolled-back one - is the current build, which is also what `modelRevision` reports.
  */
-function canaryRoute(context: Context, graph: string, actor: string, question: string, group?: string): {
+function canaryRoute(context: Context, graph: string, actor: string, question: string, group?: string,
+  filters?: { dimension: string; value: string }[]): {
   index: ModelIndex;
   stableIndex: ModelIndex;
   revision: number | null;
@@ -1140,7 +1164,7 @@ function canaryRoute(context: Context, graph: string, actor: string, question: s
 } {
   const store = new ReleaseStore(context.options.workspace, graph);
   const config = store.get();
-  const picked = pickRevision(config, actor, question, group);
+  const picked = pickRevision(config, actor, question, group, filters);
   const stableIndex = loadModel(context, graph).index;
   if (picked.revision === 'stable' || !config) {
     return { index: stableIndex, stableIndex, revision: null, side: picked.side };
@@ -1161,9 +1185,22 @@ function canaryRoute(context: Context, graph: string, actor: string, question: s
 /** Records the outcome of a canary request and rolls back automatically after repeated failures. */
 function canaryFailure(context: Context, route: { side: string; revision: number | null; store?: ReleaseStore }, error: unknown): unknown {
   if (route.side !== 'canary' || !route.store) return error;
-  route.store.record({ kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: 'unknown', detail: (error as Error).message.slice(0, 300) });
-  route.store.autoRollbackAfterErrors({ actor: 'canary-guard' });
+  route.store.record({
+    ts: context.options.now(), kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: 'unknown',
+    detail: (error as Error).message.slice(0, 300),
+  });
+  route.store.autoRollbackAfterErrors({ actor: 'canary-guard', now: context.options.now() });
   return error;
+}
+
+/** The explicit value filters a request carries, which is what a dimension-scoped canary routes on. */
+function specFilters(request: Request): { dimension: string; value: string }[] {
+  const spec = request.body.spec as { filters?: unknown } | undefined;
+  if (!Array.isArray(spec?.filters)) return [];
+  return (spec.filters as unknown[])
+    .filter((entry): entry is { dimension: string; value: string } =>
+      typeof entry === 'object' && entry !== null && typeof (entry as { dimension?: unknown }).dimension === 'string'
+      && typeof (entry as { value?: unknown }).value === 'string');
 }
 
 /** The number a quality guard compares: the answer's total, from either the semantic or the hybrid result shape. */
@@ -1178,7 +1215,7 @@ function totalOf(result: unknown): number | null {
 /** Runs `fn` against the canary index when the bucket says so, and records the outcome either way. */
 function withCanary<T>(request: Request, context: Context, graph: string, question: string,
   fn: (chosen: { index: ModelIndex; revision: number | null }) => T): T {
-  const route = canaryRoute(context, graph, request.principal.actor, question, request.group);
+  const route = canaryRoute(context, graph, request.principal.actor, question, request.group, specFilters(request));
   try {
     const result = fn({ index: route.index, revision: route.revision });
     if (route.side === 'canary' && route.qualityGuard) {
@@ -1191,10 +1228,11 @@ function withCanary<T>(request: Request, context: Context, graph: string, questi
         const moved = Math.abs(canaryTotal / stableTotal - 1);
         if (moved > route.qualityGuard.maxRelativeDelta) {
           route.store!.record({
+            ts: context.options.now(),
             kind: 'error', revision: route.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
             detail: `quality: total moved ${(moved * 100).toFixed(2)}% (canary ${canaryTotal.toFixed(2)} vs stable ${stableTotal.toFixed(2)}), limit ${(route.qualityGuard.maxRelativeDelta * 100).toFixed(2)}%`,
           });
-          route.store!.autoRollbackAfterErrors({ actor: 'canary-guard' });
+          route.store!.autoRollbackAfterErrors({ actor: 'canary-guard', now: context.options.now() });
           return result;
         }
       }
@@ -1204,11 +1242,12 @@ function withCanary<T>(request: Request, context: Context, graph: string, questi
       const refused = typeof shaped === 'object' && shaped !== null
         && Array.isArray(shaped.refusals) && shaped.refusals.length > 0 && shaped.plan === undefined;
       route.store!.record({
+        ts: context.options.now(),
         kind: refused ? 'error' : 'answer',
         revision: route.revision ?? 0, side: 'canary', actor: request.principal.actor, question,
         ...(refused ? { detail: 'the canary revision refused a question the stable revision answers' } : {}),
       });
-      if (refused) route.store!.autoRollbackAfterErrors({ actor: 'canary-guard' });
+      if (refused) route.store!.autoRollbackAfterErrors({ actor: 'canary-guard', now: context.options.now() });
     }
     return result;
   } catch (error) {

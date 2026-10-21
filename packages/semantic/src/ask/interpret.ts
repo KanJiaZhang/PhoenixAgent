@@ -38,6 +38,14 @@ export interface PeriodSpec {
 export interface QuerySpec {
   metric: string;
   dimensions: string[];
+  /**
+   * Value filters, e.g. `region = '华东'`.
+   *
+   * Explicit only: the interpreter does not parse values out of a question yet (a value vocabulary is a model
+   * question, and guessing one from a 5-row sample is how "华东" becomes "华北"). A client that knows the slice
+   * passes it; the canary release uses exactly this to scope traffic to one slice.
+   */
+  filters?: { dimension: string; value: string }[];
   period?: PeriodSpec;
   /** Compare with the same period one year (yoy) or one period (mom) earlier. */
   compare?: 'yoy' | 'mom';
