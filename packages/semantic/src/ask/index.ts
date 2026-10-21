@@ -15,3 +15,6 @@ export { askHybrid, validateProposal, buildPrompt, applyLexicon, learnWord, load
 export type { HybridAsk, HybridAskOptions, Proposal, ProposalGateway, Repair, LexiconEntry, Turn } from './hybrid.ts';
 export { DraftQueue, proposeFromQuestion } from './drafts.ts';
 export type { Draft, ProposeInput } from './drafts.ts';
+export { buildValueVocabulary, matchValues, saveVocabulary, loadVocabulary, loadAliases, addAlias, valuesPath, aliasPath } from './values.ts';
+export type { ValueVocabulary, DimensionValues, ValueAlias, ValueMatch, BuildValuesOptions } from './values.ts';
+export type { ValueContext } from './interpret.ts';

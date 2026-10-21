@@ -39,7 +39,13 @@ export interface ReleaseConfig {
   scope?: { groups?: string[]; dimension?: string; values?: string[] };
   /** When set, a canary answer whose total moves further than this against the stable answer is a failure. */
   qualityGuard?: { maxRelativeDelta: number };
-  promote?: { at: string; actor: string; answers: number; errors: number; shadow?: string };
+  /** 1 for the first attempt; a retry after a rollback increments it and records why. */
+  attempt?: number;
+  /** A retry names the rollback it is retrying, so the log cannot show a release that simply reappeared. */
+  retry?: { of: string; reason: string; at: string };
+  /** While this is in the future, an error on the promoted revision rolls the release back. */
+  watchUntil?: string;
+  promote?: { at: string; actor: string; answers: number; errors: number; shadow?: string; watchHours?: number };
   rollback?: { at: string; actor: string; reason: string; auto: boolean };
 }
 
@@ -63,6 +69,8 @@ export interface PromoteOptions {
   maxErrorRate?: number;
   /** The shadow verdict for the probe question, when one was run. */
   shadow?: 'promote' | 'hold';
+  /** How long the promoted revision stays under the error guard (0 disables it). */
+  watchHours?: number;
 }
 
 export interface PromoteDecision {
@@ -111,10 +119,16 @@ export class ReleaseStore {
   start(options: {
     from: number; to: number; canaryPct: number; actor: string; now?: string; probeQuestion?: string;
     scope?: { groups?: string[]; dimension?: string; values?: string[] }; qualityGuard?: { maxRelativeDelta: number };
+    /** Required after a rollback: what went wrong last time, and what is different now. */
+    retry?: { reason: string };
   }): ReleaseConfig {
     const existing = this.get();
     if (existing?.status === 'running') {
       throw new Error(`a release is already running for '${this.graph}' (v${existing.fromRevision} -> v${existing.toRevision}, ${existing.canaryPct}%)`);
+    }
+    // after a rollback, restarting is a decision and has to say what changed
+    if (existing?.status === 'rolled-back' && !options.retry?.reason?.trim()) {
+      throw new Error(`the last release for '${this.graph}' was rolled back (${existing.rollback?.reason ?? 'no reason'}): a retry needs a reason saying what is different`);
     }
     if (options.from === options.to) throw new Error('a release needs two different revisions');
     if (!Number.isFinite(options.canaryPct) || options.canaryPct <= 0 || options.canaryPct > 100) {
@@ -128,6 +142,10 @@ export class ReleaseStore {
       status: 'running',
       startedAt: options.now ?? new Date().toISOString(),
       startedBy: options.actor,
+      attempt: (existing?.attempt ?? 0) + 1,
+      ...(existing?.status === 'rolled-back' && options.retry
+        ? { retry: { of: existing.rollback?.reason ?? 'no reason', reason: options.retry.reason, at: options.now ?? new Date().toISOString() } }
+        : {}),
       ...(options.probeQuestion ? { probeQuestion: options.probeQuestion } : {}),
       ...(options.scope && (options.scope.groups?.length || options.scope.dimension)
         ? {
@@ -203,15 +221,20 @@ export class ReleaseStore {
       });
       throw new Error(`promotion refused: ${decision.reasons.join('; ')}`);
     }
+    const watchHours = options.watchHours ?? 24;
+    const at = options.now ?? new Date().toISOString();
     const promoted: ReleaseConfig = {
       ...config,
       canaryPct: 100,
       status: 'promoted',
+      // promotion is not the end of the guard: errors during the watch window still roll it back
+      ...(watchHours > 0 ? { watchUntil: new Date(Date.parse(at) + watchHours * 3_600_000).toISOString() } : {}),
       promote: {
-        at: options.now ?? new Date().toISOString(),
+        at,
         actor: options.actor,
         answers: decision.evidence.answers,
         errors: decision.evidence.errors,
+        watchHours,
         ...(options.shadow ? { shadow: options.shadow } : {}),
       },
     };
@@ -236,15 +259,27 @@ export class ReleaseStore {
   }
 
   /** Called after a canary error: three in a row and the release stops by itself, with the reason recorded. */
+  /** True while the promoted revision is still being watched. */
+  watchActive(now = new Date().toISOString()): boolean {
+    const config = this.get();
+    if (!config || config.status !== 'promoted' || !config.watchUntil) return false;
+    return now < config.watchUntil;
+  }
+
   autoRollbackAfterErrors(options: { actor: string; now?: string; consecutive?: number }): ReleaseConfig | null {
     const config = this.get();
-    if (!config || config.status !== 'running') return null;
+    if (!config) return null;
+    const watching = config.status === 'promoted' && config.watchUntil !== undefined
+      && (options.now ?? new Date().toISOString()) < config.watchUntil;
+    if (config.status !== 'running' && !watching) return null;
     const evidence = this.canaryEvidence();
     const threshold = options.consecutive ?? DEFAULTS.autoRollbackConsecutiveErrors;
     if (evidence.consecutiveErrors < threshold) return null;
     return this.rollback({
       actor: options.actor,
-      reason: `auto: ${evidence.consecutiveErrors} consecutive canary errors`,
+      reason: config.status === 'promoted'
+        ? `post-promotion watch: ${evidence.consecutiveErrors} consecutive errors on the new revision`
+        : `auto: ${evidence.consecutiveErrors} consecutive canary errors`,
       auto: true,
       ...(options.now ? { now: options.now } : {}),
     });

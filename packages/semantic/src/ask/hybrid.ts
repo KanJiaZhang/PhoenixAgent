@@ -26,7 +26,7 @@
 
 import type { AgentRefusal } from '../../../core/src/result.ts';
 import type { ModelIndex } from '../sql.ts';
-import { interpret, type PeriodGrain, type PeriodSpec, type QuerySpec } from './interpret.ts';
+import { interpret, type PeriodGrain, type PeriodSpec, type QuerySpec, type ValueContext } from './interpret.ts';
 import { ask, translate, type AskResult, type SemanticPlan } from './query.ts';
 import type { QueryRunner } from '../../../dataplane/src/sqlite.ts';
 import { appendJsonl, readJsonl } from '../../../core/src/workspace.ts';
@@ -266,6 +266,8 @@ export interface HybridAskOptions {
   workspace?: string;
   graph?: string;
   now?: Date;
+  /** When present, values in the question become filters (or a refusal). */
+  values?: ValueContext;
 }
 
 export async function askHybrid(options: HybridAskOptions): Promise<HybridAsk> {
@@ -277,7 +279,7 @@ export async function askHybrid(options: HybridAskOptions): Promise<HybridAsk> {
     notes.push(`lexicon rewrote 「${rewritten.applied.map((entry) => entry.word).join('、')}」`);
   }
 
-  const deterministic = interpret(rewritten.question, options.index, now);
+  const deterministic = interpret(rewritten.question, options.index, now, options.values);
   let spec = deterministic.spec;
   let source: HybridAsk['source'] = { kind: 'deterministic' };
   const repairs: Repair[] = [];
@@ -373,9 +375,9 @@ export class AskSession {
     const now = this.options.now ?? new Date();
     // Parse the follow-up alone first. "换成收入" names its own metric and must win; "那按月呢" names none, and only
     // then is the previous metric prepended so the grain word has a metric to attach to.
-    const alone = interpret(question, this.options.index, now);
+    const alone = interpret(question, this.options.index, now, this.options.values);
     const previousMetric = this.options.index.metrics.find((entry) => entry.id === previous.spec!.metric);
-    const parsed = alone.spec ? alone : interpret(`${previousMetric?.payload.name ?? ''} ${question}`, this.options.index, now);
+    const parsed = alone.spec ? alone : interpret(`${previousMetric?.payload.name ?? ''} ${question}`, this.options.index, now, this.options.values);
     const spec: QuerySpec = {
       metric: parsed.spec?.metric ?? previous.spec.metric,
       dimensions: parsed.spec?.dimensions.length ? parsed.spec.dimensions : previous.spec.dimensions,

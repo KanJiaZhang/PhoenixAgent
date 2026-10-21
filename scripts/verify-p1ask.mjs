@@ -20,7 +20,7 @@ import { assertReadOnly } from '../packages/dataplane/src/guard.ts';
 import { build } from '../packages/semantic/src/pipeline.ts';
 import { ask } from '../packages/semantic/src/ask/query.ts';
 import { indexModel } from '../packages/semantic/src/sql.ts';
-import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion } from '../packages/semantic/src/ask/index.ts';
+import { askHybrid, AskSession, validateProposal, learnWord, loadLexicon, applyLexicon, buildPrompt, DraftQueue, proposeFromQuestion, buildValueVocabulary, loadAliases, addAlias } from '../packages/semantic/src/ask/index.ts';
 
 const root = process.cwd();
 const workspace = join(root, '.pag-p1ask');
@@ -250,7 +250,53 @@ checkEqual('an unknown dimension in a filter is refused', unknownFilter.refusals
 const crossFilter = ask({ spec: { ...sliceSpec, metric: 'metric/capture_rate', dimensions: [], filters: [{ dimension: 'dim/region', value: '华东' }] }, index, run });
 checkEqual('a cross-fact metric refuses filters instead of silently ignoring them', crossFilter.refusals?.[0]?.code, 'not-in-model');
 
-section('11. determinism');
+section('11. the value vocabulary: words become slices, and a wrong word is a refusal');
+const vocabulary = buildValueVocabulary({ index, run, graph, now: now.toISOString() });
+check('the vocabulary reads labels through the foreign keys',
+  vocabulary.dimensions.some((entry) => entry.dimension === 'dim/region' && entry.source === 'dim_region.region_name'),
+  vocabulary.dimensions.map((entry) => `${entry.dimension}<-${entry.source}`).join(', '));
+check('the four regions are there', vocabulary.dimensions.find((entry) => entry.dimension === 'dim/region')?.values.length === 4,
+  JSON.stringify(vocabulary.dimensions.find((entry) => entry.dimension === 'dim/region')?.values));
+check('dates and derived levels are skipped, not enumerated',
+  vocabulary.skipped.some((entry) => entry.dimension === 'dim/stat_date' && /point in time/.test(entry.reason))
+  && vocabulary.skipped.some((entry) => entry.dimension === 'dim/month' && /derived expression/.test(entry.reason)),
+  vocabulary.skipped.map((entry) => entry.dimension + ':' + entry.reason.slice(0, 24)).join(' | '));
+const values = { vocabulary, aliases: [] };
+const slicedAsk = await askHybrid({ question: '2025 年 11 月华东大区花费', index, run, workspace, graph, now, values });
+checkEqual('a value in the question becomes a filter', JSON.stringify(slicedAsk.spec?.filters), JSON.stringify([{ dimension: 'dim/region', value: '华东' }]));
+const handSliced = run(`SELECT SUM(f.spend) AS v FROM fact_ad_daily f JOIN dim_region r ON f.region_id = r.region_id
+  WHERE f.date_key >= '2025-11-01' AND f.date_key < '2025-12-01' AND r.region_name = '华东'`).rows[0];
+check('and the answer matches hand-written SQL', Math.abs(slicedAsk.answer.answer.rows[0].measure - Number(handSliced.v)) < 0.01,
+  `${slicedAsk.answer.answer.rows[0].measure} vs ${Number(handSliced.v).toFixed(2)}`);
+const unknownValue = await askHybrid({ question: '2025 年 11 月火星大区花费', index, run, workspace, graph, now, values });
+checkEqual('an unknown value is refused, not answered for everything', unknownValue.refusals[0]?.code, 'unknown-value');
+check('the refusal lists the values that exist', (unknownValue.refusals[0]?.candidates ?? []).length === 4,
+  (unknownValue.refusals[0]?.candidates ?? []).join('、'));
+const ambiguousVocabulary = {
+  ...vocabulary,
+  dimensions: [
+    ...vocabulary.dimensions,
+    { dimension: 'dim/channel', name: 'channel', source: 'dim_channel.channel_name', values: ['信息流', '华东'], sql: '' },
+  ],
+};
+const ambiguous = await askHybrid({ question: '2025 年 11 月华东花费', index, run, workspace, graph, now, values: { vocabulary: ambiguousVocabulary, aliases: [] } });
+checkEqual('a word under two dimensions is refused', ambiguous.refusals[0]?.code, 'ambiguous-value');
+const alias = addAlias({
+  workspace, graph, vocabulary, word: '华东区', dimension: 'dim/region', value: '华东',
+  actor: 'bob', note: 'business says 华东区', now: now.toISOString(),
+});
+checkEqual('an alias points at a real value', alias.value, '华东');
+const aliased = await askHybrid({ question: '2025 年 11 月华东区花费', index, run, workspace, graph, now, values: { vocabulary, aliases: loadAliases(workspace, graph) } });
+check('and the alias filters the same way', aliased.spec?.filters?.[0]?.value === '华东', JSON.stringify(aliased.spec?.filters));
+let badAlias = null;
+try {
+  addAlias({ workspace, graph, vocabulary, word: '东北区', dimension: 'dim/region', value: '东北', actor: 'bob' });
+} catch (error) {
+  badAlias = error;
+}
+check('an alias onto a value that does not exist is refused', badAlias !== null, badAlias?.message ?? '');
+
+section('12. determinism');
 const again = await askHybrid({ question: '2025 年 11 月各大区毛利', index, run, workspace, graph, now });
 check('the same question gives the same SQL', again.plan?.sql[0] === afterLearning.plan?.sql[0], 'identical statements');
 

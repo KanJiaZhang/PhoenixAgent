@@ -200,6 +200,20 @@ document.querySelectorAll('[data-act]').forEach((button) => {
       if (!reason) return show(releaseOut2, { note: '回滚需要理由，已取消' });
       return show(releaseOut2, await api('POST', '/v1/semantic/release', { action: 'rollback', reason }));
     }
+    if (action === 'release-values') {
+      const result = await api('GET', '/v1/semantic/values');
+      if (!result.ok) return show(releaseOut2, result);
+      if (!result.body.vocabulary) {
+        const built = await api('POST', '/v1/semantic/values', { action: 'build' });
+        return show(releaseOut2, built.ok ? built.body : built);
+      }
+      return show(releaseOut2, {
+        builtAt: result.body.vocabulary.builtAt,
+        dimensions: result.body.vocabulary.dimensions.map((entry) => ({ dimension: entry.dimension, source: entry.source, values: entry.values })),
+        skipped: result.body.vocabulary.skipped.map((entry) => entry.dimension + ': ' + entry.reason),
+        aliases: result.body.aliases,
+      });
+    }
     if (action === 'release-timeline') {
       const result = await api('GET', '/v1/semantic/timeline?limit=60');
       if (!result.ok) return show(releaseOut2, result);

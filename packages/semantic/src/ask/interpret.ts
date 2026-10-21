@@ -22,6 +22,7 @@
 import type { AgentRefusal } from '../../../core/src/result.ts';
 import type { ModelIndex } from '../sql.ts';
 import { tableOfColumnId } from '../sql.ts';
+import { matchValues, type ValueAlias, type ValueVocabulary } from './values.ts';
 
 export type PeriodGrain = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
@@ -53,6 +54,12 @@ export interface QuerySpec {
   descending: boolean;
   /** The words that were matched, so the answer can explain itself. */
   matched: string[];
+}
+
+/** The value vocabulary plus its reviewed aliases: what turns "华东" into a filter. */
+export interface ValueContext {
+  vocabulary: ValueVocabulary;
+  aliases?: ValueAlias[];
 }
 
 export interface Interpretation {
@@ -105,7 +112,7 @@ const GRAIN = /(?:按|每)(天|日|周|月|季度|年)|(天级|周级|月级|季
 const COMPARE = /(同比|环比|和去年比|比去年|跟上月比)/;
 
 /** Interprets a question against one metric's vocabulary. */
-export function interpret(question: string, index: ModelIndex, now = new Date()): Interpretation {
+export function interpret(question: string, index: ModelIndex, now = new Date(), values?: ValueContext): Interpretation {
   const text = question.trim();
   const refusals: AgentRefusal[] = [];
   const notes: string[] = [];
@@ -183,6 +190,14 @@ export function interpret(question: string, index: ModelIndex, now = new Date())
     }
   }
 
+  // value words become filters, or a refusal - never a silent "all regions"
+  const valueMatch = values ? matchValues(text, index, values.vocabulary, values.aliases ?? []) : { filters: [], matched: [] };
+  if ("refusal" in valueMatch && valueMatch.refusal) {
+    return { spec: null, refusals: [{ ...valueMatch.refusal }], notes };
+  }
+  const filters = valueMatch.filters;
+  if (filters.length > 0) matched.push(...valueMatch.matched);
+
   const topMatch = TOP_N.exec(text);
   const compare = COMPARE.test(text) ? (/环比|跟上月比/.test(text) ? 'mom' : 'yoy') : undefined;
 
@@ -191,6 +206,7 @@ export function interpret(question: string, index: ModelIndex, now = new Date())
       metric: metric.id,
       dimensions,
       ...(period.spec ? { period: period.spec } : {}),
+      ...(filters.length > 0 ? { filters } : {}),
       ...(compare ? { compare } : {}),
       ...(topMatch ? { topN: Number(topMatch[1]) } : {}),
       descending: !/最低|最少|最小的?/.test(text),

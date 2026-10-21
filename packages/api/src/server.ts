@@ -39,6 +39,7 @@ import { diffModels, driftReport, shadowAsk, releaseGate, type LiveTable } from 
 import { ReleaseStore, pickRevision } from '../../semantic/src/release.ts';
 import { buildTimeline } from '../../semantic/src/timeline.ts';
 import { ask, askHybrid, AskSession, DraftQueue, learnWord, loadLexicon, lexiconPath, proposeFromQuestion, type Turn } from '../../semantic/src/ask/index.ts';
+import { addAlias, buildValueVocabulary, loadAliases, loadVocabulary, saveVocabulary, valuesPath } from '../../semantic/src/ask/index.ts';
 import { buildWriteback, validateWriteback, submitWriteback, dryRunAdapter, type PlatformAdapter, type WritebackPlan } from '../../agents/campaign/src/writeback.ts';
 import { IdempotencyStore } from '../../agents/campaign/src/idempotency.ts';
 import { createGateway } from '../../core/src/llm.ts';
@@ -462,6 +463,7 @@ function buildRoutes(): RouteDef[] {
             index: chosen.index,
             run,
             modelRevision: chosen.revision,
+            ...(valueContext(context, graph) ? { values: valueContext(context, graph) } : {}),
           })));
       },
     },
@@ -498,6 +500,9 @@ function buildRoutes(): RouteDef[] {
             const guard = request.body.qualityGuard as { maxRelativeDelta?: unknown } | undefined;
             return store.start({
               from, to, canaryPct: Number(request.body.canaryPct ?? 10),
+              ...(request.body.retry && typeof (request.body.retry as { reason?: unknown }).reason === 'string'
+                ? { retry: { reason: String((request.body.retry as { reason: string }).reason) } }
+                : {}),
               actor: request.principal.actor, now,
               ...(typeof request.body.question === 'string' ? { probeQuestion: request.body.question } : {}),
               ...(scope && (Array.isArray(scope.groups) || typeof scope.dimension === 'string')
@@ -548,7 +553,12 @@ function buildRoutes(): RouteDef[] {
             }
           }
           try {
-            return store.promote({ actor: request.principal.actor, now, ...(shadow ? { shadow } : {}) });
+            const watchHours = optionalNumber(request.body, 'watchHours');
+            return store.promote({
+              actor: request.principal.actor, now,
+              ...(shadow ? { shadow } : {}),
+              ...(watchHours === undefined ? {} : { watchHours }),
+            });
           } catch (error) {
             throw new HttpError(409, 'promotion-refused', (error as Error).message,
               'GET /v1/semantic/release shows the canary evidence; more traffic or a fix is what unblocks it');
@@ -924,6 +934,7 @@ function buildRoutes(): RouteDef[] {
         const result = await withDatabaseAsync(context, async (run) => {
           const session = new AskSession({
             index: routing.index, run, workspace: context.options.workspace, graph, gateway, now: new Date(context.options.now()),
+            ...(valueContext(context, graph) ? { values: valueContext(context, graph) } : {}),
           });
           const answer = await session.ask(question);
           return { answer, turn: session.turns[session.turns.length - 1]! };
@@ -998,6 +1009,54 @@ function buildRoutes(): RouteDef[] {
           ...(target === undefined ? {} : { targetServiceLevel: target }),
           ...(sla === undefined ? {} : { slaHours: sla }),
         });
+      },
+    },
+    {
+      method: 'GET', path: '/v1/semantic/values', role: 'viewer',
+      summary: 'the value vocabulary: which words are a slice of which dimension, and where they were read from',
+      input: ['graph'],
+      handler: (request, context) => {
+        const graph = String(request.query.get('graph') ?? context.options.graph);
+        return {
+          vocabulary: loadVocabulary(context.options.workspace, graph),
+          aliases: loadAliases(context.options.workspace, graph),
+          path: valuesPath(context.options.workspace, graph),
+        };
+      },
+    },
+    {
+      method: 'POST', path: '/v1/semantic/values', role: 'analyst',
+      summary: 'rebuild the value vocabulary from the warehouse, or record an alias for a value',
+      input: ['action', 'word', 'dimension', 'value', 'note'],
+      handler: (request, context) => {
+        const graph = String(request.body.graph ?? context.options.graph);
+        const action = String(request.body.action ?? 'build');
+        if (action === 'build') {
+          const { index } = loadModel(context, graph);
+          const vocabulary = withDatabase(context, (run) => buildValueVocabulary({
+            index, run, graph, now: context.options.now(),
+            ...(Array.isArray(request.body.dimensions) ? { dimensionIds: (request.body.dimensions as unknown[]).map(String) } : {}),
+          }));
+          saveVocabulary(context.options.workspace, vocabulary);
+          return vocabulary;
+        }
+        if (action === 'alias') {
+          const vocabulary = loadVocabulary(context.options.workspace, graph);
+          if (!vocabulary) {
+            throw new HttpError(409, 'no-vocabulary', `no value vocabulary for '${graph}'`, 'POST /v1/semantic/values {"action":"build"} first');
+          }
+          try {
+            return addAlias({
+              workspace: context.options.workspace, graph, vocabulary,
+              word: requireString(request.body, 'word'), dimension: requireString(request.body, 'dimension'),
+              value: requireString(request.body, 'value'), actor: request.principal.actor,
+              note: String(request.body.note ?? ''), now: context.options.now(),
+            });
+          } catch (error) {
+            throw new HttpError(409, 'alias-refused', (error as Error).message);
+          }
+        }
+        throw new HttpError(400, 'bad-parameter', `unknown action '${action}'`, 'use build or alias');
       },
     },
     {
@@ -1161,6 +1220,8 @@ function canaryRoute(context: Context, graph: string, actor: string, question: s
   side: 'stable' | 'canary' | 'promoted' | 'rolled-back' | 'none' | 'out-of-scope';
   store?: ReleaseStore;
   qualityGuard?: { maxRelativeDelta: number };
+  /** True while a promoted revision is still inside its watch window. */
+  watching?: boolean;
 } {
   const store = new ReleaseStore(context.options.workspace, graph);
   const config = store.get();
@@ -1179,6 +1240,7 @@ function canaryRoute(context: Context, graph: string, actor: string, question: s
   return {
     index: indexModel(snapshot.candidates), stableIndex, revision: config.toRevision,
     side: picked.side, store, ...(config.qualityGuard ? { qualityGuard: config.qualityGuard } : {}),
+    ...(store.watchActive(context.options.now()) ? { watching: true } : {}),
   };
 }
 
@@ -1191,6 +1253,12 @@ function canaryFailure(context: Context, route: { side: string; revision: number
   });
   route.store.autoRollbackAfterErrors({ actor: 'canary-guard', now: context.options.now() });
   return error;
+}
+
+function valueContext(context: Context, graph: string) {
+  const vocabulary = loadVocabulary(context.options.workspace, graph);
+  if (!vocabulary) return undefined;
+  return { vocabulary, aliases: loadAliases(context.options.workspace, graph) };
 }
 
 /** The explicit value filters a request carries, which is what a dimension-scoped canary routes on. */
@@ -1218,7 +1286,8 @@ function withCanary<T>(request: Request, context: Context, graph: string, questi
   const route = canaryRoute(context, graph, request.principal.actor, question, request.group, specFilters(request));
   try {
     const result = fn({ index: route.index, revision: route.revision });
-    if (route.side === 'canary' && route.qualityGuard) {
+    const guarded = route.side === 'canary' || (route.side === 'promoted' && route.watching === true);
+    if (guarded && route.qualityGuard) {
       // the guard answers the same question on the stable revision: a canary whose *number* moved is a failure even
       // when it did not throw, which is the whole point of a canary on a model change
       const stable = fn({ index: route.stableIndex, revision: null });
@@ -1237,7 +1306,7 @@ function withCanary<T>(request: Request, context: Context, graph: string, questi
         }
       }
     }
-    if (route.side === 'canary') {
+    if (guarded) {
       const shaped = result as unknown as { refusals?: unknown[]; plan?: unknown } | null;
       const refused = typeof shaped === 'object' && shaped !== null
         && Array.isArray(shaped.refusals) && shaped.refusals.length > 0 && shaped.plan === undefined;

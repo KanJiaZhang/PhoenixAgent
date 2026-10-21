@@ -169,9 +169,20 @@ try {
   check('the event log has start, answers and the rollback', ['start', 'answer', 'rollback'].every((kind) => events.some((event) => event.kind === kind)),
     [...new Set(events.map((event) => event.kind))].join(','));
 
-  section('6. three failures in a row stop a release without anyone deciding');
-  const restarted = await http('POST', '/v1/semantic/release', { action: 'start', from: 1, to: 3, canaryPct: 100 }, 'owner');
-  checkEqual('a new release can start after a rollback', restarted.status, 200);
+  section('5b. a retry after a rollback has to say what is different');
+  const blindRetry = await http('POST', '/v1/semantic/release', { action: 'start', from: 1, to: 3, canaryPct: 100 }, 'owner');
+  checkEqual('restarting without a reason is refused', blindRetry.status, 409);
+  check('and the refusal quotes the rollback it is retrying', /rolled back/.test(blindRetry.body.error.message),
+    blindRetry.body.error.message.slice(0, 120));
+  const restarted = await http('POST', '/v1/semantic/release', {
+    action: 'start', from: 1, to: 3, canaryPct: 100,
+    retry: { reason: 'v3 only drops a metric the question does not use' },
+  }, 'owner');
+  checkEqual('with a reason it starts', restarted.status, 200);
+  checkEqual('and it is marked as the second attempt', restarted.body.attempt, 2);
+  check('the retry records the rollback it retries and the new reason',
+    (restarted.body.retry?.of ?? '').length > 0 && /only drops a metric/.test(restarted.body.retry?.reason ?? ''),
+    JSON.stringify(restarted.body.retry));
   checkEqual('at 100% everyone is on the canary', pickRevision(restarted.body, 'anyone', 'anything').side, 'canary');
   // v3 dropped metric/roi: the same question answers on the stable side and refuses on the canary
   const roiQuestion = '2025 年 11 月各大区 ROI';
@@ -192,6 +203,7 @@ try {
   section('7. a scoped release only reaches its groups');
   const scoped = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, scope: { groups: ['beta'] },
+    retry: { reason: 'scope test' },
   }, 'owner');
   checkEqual('the scope is stored with the release', scoped.body.scope?.groups?.[0], 'beta');
   const outsider = await http('POST', '/v1/semantic/ask', { question }, 'canary-key');
@@ -205,6 +217,7 @@ try {
   section('7b. a canary can be scoped to a slice of the answer, not just to people');
   const dimensionScoped = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, scope: { dimension: 'dim/region', values: ['华东'] },
+    retry: { reason: 'slice test' },
   }, 'owner');
   checkEqual('the slice is stored with the release', dimensionScoped.body.scope?.dimension, 'dim/region');
   checkEqual('with the values it covers', JSON.stringify(dimensionScoped.body.scope?.values), '["华东"]');
@@ -228,6 +241,7 @@ try {
   section('8. a canary whose number moves is a failure, not just a slow release');
   const guarded = await http('POST', '/v1/semantic/release', {
     action: 'start', from: 1, to: 2, canaryPct: 100, qualityGuard: { maxRelativeDelta: 0.02 },
+    retry: { reason: 'quality guard test' },
   }, 'owner');
   check('the guard is stored with the release', guarded.body.qualityGuard?.maxRelativeDelta === 0.02,
     JSON.stringify(guarded.body.qualityGuard));
@@ -244,6 +258,37 @@ try {
   const afterQuality = (await http('GET', '/v1/semantic/release')).body;
   checkEqual('three of them stop the release', afterQuality.config.status, 'rolled-back');
   check('and the reason is the guard\'s', /consecutive canary errors/.test(afterQuality.config.rollback.reason), afterQuality.config.rollback.reason);
+
+  section('8b. promotion opens a watch window, and the guard stays on');
+  const watch = new ReleaseStore(workspace, 'demo-watch');
+  watch.start({ from: 1, to: 2, canaryPct: 100, actor: 'alice', now: '2026-10-29T00:00:00.000Z' });
+  for (let index = 0; index < 30; index++) {
+    watch.record({ ts: '2026-10-29T00:10:00.000Z', kind: 'answer', revision: 2, side: 'canary', actor: 'bulk-' + index, question: 'q' });
+  }
+  const promoted = watch.promote({ actor: 'alice', now: '2026-10-29T01:00:00.000Z', watchHours: 24 });
+  check('the promoted release carries a watch window', typeof promoted.watchUntil === 'string' && promoted.watchUntil > '2026-10-29T01:00:00.000Z',
+    promoted.watchUntil);
+  check('and the window is the length that was asked for', promoted.promote.watchHours === 24, String(promoted.promote.watchHours));
+  check('the guard is active inside the window', watch.watchActive('2026-10-29T12:00:00.000Z') === true);
+  check('and inactive after it', watch.watchActive('2026-10-30T02:00:00.000Z') === false);
+  for (let index = 0; index < 3; index++) {
+    watch.record({ ts: '2026-10-29T02:0' + index + ':00.000Z', kind: 'error', revision: 2, side: 'canary', actor: 'guard-test', question: 'q' });
+  }
+  const watched = watch.autoRollbackAfterErrors({ actor: 'canary-guard', now: '2026-10-29T02:10:00.000Z' });
+  check('three errors after promotion roll it back', watched?.status === 'rolled-back', watched?.status ?? 'null');
+  check('with a reason that says it was the watch window', /post-promotion watch/.test(watched?.rollback?.reason ?? ''),
+    watched?.rollback?.reason ?? '');
+  const noWatch = new ReleaseStore(workspace, 'demo-nowatch');
+  noWatch.start({ from: 1, to: 2, canaryPct: 100, actor: 'alice', now: '2026-10-29T00:00:00.000Z' });
+  for (let index = 0; index < 30; index++) {
+    noWatch.record({ ts: '2026-10-29T00:10:00.000Z', kind: 'answer', revision: 2, side: 'canary', actor: 'a', question: 'q' });
+  }
+  const noWindow = noWatch.promote({ actor: 'alice', now: '2026-10-29T01:00:00.000Z', watchHours: 0 });
+  check('watchHours 0 opens no window', noWindow.watchUntil === undefined, String(noWindow.watchUntil));
+  for (let index = 0; index < 3; index++) {
+    noWatch.record({ ts: '2026-10-29T02:00:00.000Z', kind: 'error', revision: 2, side: 'canary', actor: 'x', question: 'q' });
+  }
+  check('so errors after it do not roll back', noWatch.autoRollbackAfterErrors({ actor: 'canary-guard', now: '2026-10-29T02:10:00.000Z' }) === null);
 
   section('9. one timeline: what changed, when, and who said yes');
   // a learned word and a review line, so the timeline has more than one source

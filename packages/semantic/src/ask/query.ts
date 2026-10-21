@@ -19,7 +19,7 @@ import type { AgentRefusal } from '../../../core/src/result.ts';
 import { RenderError, dimensionValueExpr, renderByDimension, renderCrossFact, renderTotal, type ModelIndex } from '../sql.ts';
 import type { MergedCandidate } from '../merge.ts';
 import { analyze, type Finding } from '../../../sqllayer/src/analyze.ts';
-import { interpret, requestedGrain, type QuerySpec } from './interpret.ts';
+import { interpret, requestedGrain, type QuerySpec, type ValueContext } from './interpret.ts';
 
 export interface SemanticPlan {
   spec: QuerySpec;
@@ -43,6 +43,8 @@ export interface TranslateRequest {
   candidates?: MergedCandidate[];
   modelRevision?: number | null;
   now?: Date;
+  /** When present, values in the question become filters (or a refusal). */
+  values?: ValueContext;
 }
 
 export interface TranslateResult {
@@ -54,7 +56,7 @@ export interface TranslateResult {
 export function translate(request: TranslateRequest): TranslateResult {
   const interpreted = request.spec
     ? { spec: request.spec, refusals: [] as AgentRefusal[], notes: [] as string[] }
-    : interpret(request.question ?? '', request.index, request.now);
+    : interpret(request.question ?? '', request.index, request.now, request.values);
   if (!interpreted.spec) return { plan: null, refusals: interpreted.refusals, notes: interpreted.notes };
 
   const spec = interpreted.spec;

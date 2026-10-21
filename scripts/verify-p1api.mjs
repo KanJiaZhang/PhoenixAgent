@@ -82,7 +82,7 @@ try {
   section('1. the catalogue carries the new routes, with their roles');
   const catalogue = await http('GET', '/v1/tools');
   const tools = catalogue.body.tools;
-  check('the catalogue grew', tools.length >= 39, `${tools.length} routes`);
+  check('the catalogue grew', tools.length >= 41, `${tools.length} routes`);
   const expected = [
     ['POST', '/v1/semantic/version', 'viewer'],
     ['POST', '/v1/semantic/shadow', 'viewer'],
@@ -99,6 +99,8 @@ try {
     ['POST', '/v1/semantic/lexicon/drafts', 'analyst'],
     ['POST', '/v1/semantic/lexicon/drafts/:id', 'analyst'],
     ['GET', '/v1/semantic/timeline', 'viewer'],
+    ['GET', '/v1/semantic/values', 'viewer'],
+    ['POST', '/v1/semantic/values', 'analyst'],
   ];
   for (const [method, path, role] of expected) {
     const tool = tools.find((entry) => entry.method === method && entry.path === path);
@@ -113,7 +115,7 @@ try {
   check('the release tab is in the page', consolePage.includes('data-tab="release"'));
   check('the page has five workbenches', (consolePage.match(/data-tab=/g) ?? []).length === 5,
     `${(consolePage.match(/data-tab=/g) ?? []).length} tabs`);
-  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback', '/v1/semantic/release', '/v1/semantic/lexicon/drafts', '/v1/semantic/timeline']) {
+  for (const path of ['/v1/semantic/version', '/v1/risk/conflicts', '/v1/risk/capacity', '/v1/graph/features', '/v1/ask/hybrid', '/v1/campaign/writeback', '/v1/semantic/release', '/v1/semantic/lexicon/drafts', '/v1/semantic/timeline', '/v1/semantic/values']) {
     check(`the console calls ${path}`, consoleScript.includes(path));
   }
 
@@ -247,6 +249,28 @@ try {
   check('and a payload hash that is not the key', store.every((entry) => entry.payloadHash.length === 32 && entry.payloadHash !== entry.key),
     store[0]?.payloadHash?.slice(0, 8) ?? '');
   delete process.env.PAGENT_WRITEBACK_URL;
+
+  section('5b. the value vocabulary: build it, then a word becomes a slice');
+  const noVocabulary = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东大区花费' });
+  check('before the vocabulary exists the word is ignored (the documented gap)',
+    noVocabulary.body.answer?.total !== null && noVocabulary.body.answer?.rows?.length === 4,
+    noVocabulary.body.answer?.rows?.length + ' rows');
+  const builtValues = await http('POST', '/v1/semantic/values', { action: 'build' }, 'analyst');
+  checkEqual('the vocabulary builds', builtValues.status, 200);
+  check('with the region labels read through the foreign key',
+    builtValues.body.dimensions.some((entry) => entry.dimension === 'dim/region' && entry.source === 'dim_region.region_name'),
+    builtValues.body.dimensions.map((entry) => entry.dimension).join(','));
+  const filtered = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东大区花费' });
+  check('now the same question is a slice', filtered.body.answer?.rows?.length === 1 && filtered.body.answer.total > 1000000,
+    JSON.stringify(filtered.body.answer?.rows));
+  const wrongValue = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月火星大区花费' });
+  checkEqual('an unknown value is a refusal', wrongValue.body.refusals?.[0]?.code, 'unknown-value');
+  const alias = await http('POST', '/v1/semantic/values', { action: 'alias', word: '华东区', dimension: 'dim/region', value: '华东' }, 'analyst');
+  checkEqual('an alias is accepted', alias.status, 200);
+  const aliasedAsk = await http('POST', '/v1/semantic/ask', { question: '2025 年 11 月华东区花费' });
+  check('and the alias answers the same slice', aliasedAsk.body.answer?.rows?.length === 1, JSON.stringify(aliasedAsk.body.answer?.rows));
+  const viewerAlias = await http('POST', '/v1/semantic/values', { action: 'alias', word: '华南区', dimension: 'dim/region', value: '华南' });
+  checkEqual('a viewer cannot write an alias', viewerAlias.status, 403);
 
   section('6b. the timeline merges the audit, the lexicon and the releases');
   const timeline = await http('GET', '/v1/semantic/timeline?limit=100');

@@ -14,7 +14,10 @@ export interface AgentRefusal {
     | 'not-in-model'
     | 'unvalidated'
     | 'out-of-scope'
-    | 'budget';
+    | 'budget'
+    // value vocabulary: the word belongs to two dimensions, or to none
+    | 'ambiguous-value'
+    | 'unknown-value';
   message: string;
   /** What would make it answerable, stated as an action: "add the metric", "pick one of these". */
   hint?: string;
